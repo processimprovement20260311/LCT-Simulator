@@ -175,31 +175,6 @@ RAW_RATINGS = {
 BASE_RATINGS = {team: Ratings(stats["OFF"], stats["DEF"], stats["SPT"], round((stats["OFF"]*3 + stats["DEF"]*3 + stats["SPT"]) / 7, 2)) for team, stats in RAW_RATINGS.items()}
 TEAMS = list(BASE_RATINGS.keys())
 
-MONTHS = [("Jan",29),("Feb",29),("Mar",32),("Apr",32),("May",32),("Jun",32),("Jul",32),("Aug",32),("Sep",32),("Oct",32),("Nov",32),("Dec",32)]
-def lct_date(m, d): return f"{MONTHS[m][0]} {d:02d}"
-
-def assign_league_dates(schedule):
-    regular_r1_30 = [g for g in schedule if g["round"] <= 30 and g.get("game_date") != "Mar 03"]
-    r31_games = [g for g in schedule if g["round"] == 31]
-    r32_games = [g for g in schedule if g["round"] == 32]
-    regular_r33_62 = [g for g in schedule if g["round"] >= 33]
-    current_m = 2; current_d = 4; games_today = 0
-    for g in regular_r1_30:
-        if games_today >= 6:
-            current_d += 1; games_today = 0
-            if current_d > MONTHS[current_m][1]: current_d = 1; current_m += 1
-        g["game_date"] = lct_date(current_m, current_d); games_today += 1
-    for i, g in enumerate(r31_games): g["game_date"] = "May 23" if i < 8 else "May 24"
-    for i, g in enumerate(r32_games): g["game_date"] = "May 25" if i < 8 else "May 26"
-    current_m = 5; current_d = 1; games_today = 0
-    for g in regular_r33_62:
-        if g["round"] == 62: g["game_date"] = "Aug 27"; continue
-        if games_today >= 6:
-            current_d += 1; games_today = 0
-            if current_d > MONTHS[current_m][1]: current_d = 1; current_m += 1
-        g["game_date"] = lct_date(current_m, current_d); games_today += 1
-    return schedule
-
 def compute_league_table(schedule, game_results, tiebreak_rng=None):
     if tiebreak_rng is None: tiebreak_rng = Xoshiro(0)
     table = {t: {"pts":0,"gd":0,"gf":0,"w":0,"d":0,"l":0} for t in TEAMS}
@@ -218,7 +193,6 @@ def compute_league_table(schedule, game_results, tiebreak_rng=None):
         grp = by_pts[pts]
         if len(grp) == 1: ranked.extend(grp)
         else:
-            # Simplified tiebreaker for the web app (Sorts by GD then GF)
             grp.sort(key=lambda x: (table[x]["gd"], table[x]["gf"]), reverse=True)
             ranked.extend(grp)
     return ranked, table
@@ -297,11 +271,92 @@ if run_clicked:
             for i in range(1, mode_params["num_sims"] + 1):
                 game_seed = (run_seed + i) & MASK64
                 subs = SubStreams(game_seed)
-                # Added force_test_weather=True so Mode 1 respects the weather dropdown
                 res = sim_game(mode_params["home_team"], mode_params["away_team"], mode_params["venue"], False, subs, "league", "R1", "Mar 03", BASE_RATINGS, 1, forced_weather=forced_weather_setting(), force_test_weather=True)
                 rows.append({"Game": i, "Home": res["home_team"], "Away": res["away_team"], "Score": f"{res['home_score']}–{res['away_score']}", "Winner": res["winner"] or "Draw", "Weather": res["weather"]})
         st.success(f"Ran {mode_params['num_sims']} games.")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # ---------------- MODE 2 (STANDALONE LEAGUE) ----------------
+    elif mode_num == 2:
+        with st.spinner("Simulating League Phase..."):
+            subs = SubStreams(run_seed)
+            schedule = [{"round": r, "home": TEAMS[i], "away": TEAMS[(i + r) % len(TEAMS)]} for r in range(1, 32) for i in range(len(TEAMS))]
+            schedule += [{"round": g["round"] + 31, "home": g["away"], "away": g["home"]} for g in schedule[:]]
+            
+            results = []
+            for g in schedule:
+                results.append(sim_game(g["home"], g["away"], "home", False, subs, "league", f"R{g['round']}", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()))
+            
+            ranked, table = compute_league_table(schedule, results, subs.get("tiebreaks"))
+            st.success(f"League Champion: **{ranked[0]}**")
+            
+            df_rows = [{"Pos": i+1, "Team": t, "W": table[t]["w"], "D": table[t]["d"], "L": table[t]["l"], "Pts": table[t]["pts"], "GD": table[t]["gd"]} for i, t in enumerate(ranked)]
+            st.dataframe(pd.DataFrame(df_rows), hide_index=True, use_container_width=True)
+
+    # ---------------- MODE 3 (STANDALONE CUP) ----------------
+    elif mode_num == 3:
+        with st.spinner("Simulating Cup..."):
+            subs = SubStreams(run_seed)
+            t_list = TEAMS[:]; substream_shuffle(t_list, subs.get("cup_draw"))
+            groups = [t_list[i*4:(i+1)*4] for i in range(8)]
+            winners, runners = [], []
+            for grp in groups:
+                g_pts = {x: 0 for x in grp}; g_gd = {x: 0 for x in grp}; g_gf = {x: 0 for x in grp}
+                for i in range(4):
+                    for j in range(4):
+                        if i != j:
+                            r = sim_game(grp[i], grp[j], "home", False, subs, "cup_group", "G", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+                            hs, as_ = r["home_score"], r["away_score"]
+                            g_gf[grp[i]] += hs; g_gf[grp[j]] += as_
+                            g_gd[grp[i]] += hs - as_; g_gd[grp[j]] += as_ - hs
+                            if hs > as_: g_pts[grp[i]] += 3
+                            elif as_ > hs: g_pts[grp[j]] += 3
+                            else: g_pts[grp[i]] += 1; g_pts[grp[j]] += 1
+                ordered = sorted(grp, key=lambda x: (-g_pts[x], -g_gd[x], -g_gf[x]))
+                winners.append(ordered[0]); runners.append(ordered[1])
+            
+            seeds = winners + runners
+            
+            def play_bo7(hi, lo):
+                wins = {hi:0, lo:0}
+                for g in range(7):
+                    res = sim_game(hi, lo, "home", True, subs, "cup_knockout", "Bo7", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+                    wins[res["winner"]] += 1
+                return hi if wins[hi] > wins[lo] else lo, wins[hi], wins[lo]
+
+            r16_w = [play_bo7(seeds[i], seeds[15-i]) for i in range(8)]
+            qf_w = [play_bo7(r16_w[a][0], r16_w[b][0]) for a, b in [(0,7),(3,4),(1,6),(2,5)]]
+            sf_w = [play_bo7(qf_w[0][0], qf_w[1][0]), play_bo7(qf_w[2][0], qf_w[3][0])]
+            cup_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "cup_final", "Final", "Oct 26", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+            
+            st.success(f"Cup Champion: **{cup_final['winner']}**")
+            st.write(f"Final: {cup_final['away_team']} ({cup_final['away_score']}) at {cup_final['home_team']} ({cup_final['home_score']})")
+            
+            rounds = {"Round of 16": r16_w, "Quarterfinals": qf_w, "Semifinals": sf_w}
+            for rname, rdata in rounds.items():
+                st.write(f"**{rname}**")
+                rows = [{"Matchup": f"{seeds[i]} vs {seeds[15-i]}" if rname == "Round of 16" else "...", "Winner": w, "Series": f"{hw}-{lw}"} for (w, hw, lw) in rdata]
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # ---------------- MODE 4 (STANDALONE SOE) ----------------
+    elif mode_num == 4:
+        with st.spinner("Simulating SOE..."):
+            subs = SubStreams(run_seed)
+            t = TEAMS[:]; substream_shuffle(t, subs.get("soe_draw"))
+            def sim_2leg(t1, t2):
+                r1 = sim_game(t1, t2, "home", False, subs, "soe_r32", "L1", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+                r2 = sim_game(t2, t1, "home", False, subs, "soe_r32", "L2", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+                winner, _, _ = resolve_soe_tie(t1, t2, r1, r2, subs, "TBD")
+                return winner, r1, r2
+            
+            r32_w = [sim_2leg(t[i*2], t[i*2+1]) for i in range(16)]
+            r16_w = [sim_2leg(r32_w[i*2][0], r32_w[i*2+1][0]) for i in range(8)]
+            qf_w = [sim_2leg(r16_w[i*2][0], r16_w[i*2+1][0]) for i in range(4)]
+            sf_w = [sim_2leg(qf_w[i*2][0], qf_w[i*2+1][0]) for i in range(2)]
+            soe_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "soe_final", "Final", "Nov 24", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
+            
+            st.success(f"SOE Champion: **{soe_final['winner']}**")
+            st.write(f"Final: {soe_final['away_team']} ({soe_final['away_score']}) at {soe_final['home_team']} ({soe_final['home_score']})")
 
     # ---------------- MODE 6 & 7 (SEASON RUNNER) ----------------
     elif mode_num in [6, 7]:
@@ -320,11 +375,10 @@ if run_clicked:
             # 1. League
             schedule = [{"round": r, "home": TEAMS[i], "away": TEAMS[(i + r) % len(TEAMS)]} for r in range(1, 32) for i in range(len(TEAMS))]
             schedule += [{"round": g["round"] + 31, "home": g["away"], "away": g["home"]} for g in schedule[:]]
-            schedule = assign_league_dates(schedule)
             
             results = []
             for g in schedule:
-                results.append(sim_game(g["home"], g["away"], "home", False, subs, "league", f"R{g['round']}", g.get("game_date", "TBD"), BASE_RATINGS, season, forced_weather=forced_weather_setting()))
+                results.append(sim_game(g["home"], g["away"], "home", False, subs, "league", f"R{g['round']}", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()))
             
             ranked, table = compute_league_table(schedule, results, subs.get("tiebreaks"))
             league_champ = ranked[0]
@@ -351,7 +405,6 @@ if run_clicked:
                 ordered = sorted(grp, key=lambda x: (-g_pts[x], -g_gd[x], -g_gf[x]))
                 winners.append(ordered[0]); runners.append(ordered[1])
             
-            def rec_key(t): return (-g_pts[t], -g_gd[t], -g_gf[t]) 
             seeds = winners + runners
             
             def play_bo7(hi, lo):
