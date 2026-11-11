@@ -15,7 +15,7 @@ import streamlit as st
 import pandas as pd
 
 # ============================================================
-# ENGINE CORE (Unchanged logic, stripped of CLI print/input)
+# ENGINE CORE
 # ============================================================
 Q_HALF = 12
 MARQUEE_OPENER_DATE = "Mar 03"
@@ -324,9 +324,28 @@ if run_clicked:
                     wins[res["winner"]] += 1
                 return hi if wins[hi] > wins[lo] else lo, wins[hi], wins[lo]
 
-            r16_w = [play_bo7(seeds[i], seeds[15-i]) for i in range(8)]
-            qf_w = [play_bo7(r16_w[a][0], r16_w[b][0]) for a, b in [(0,7),(3,4),(1,6),(2,5)]]
-            sf_w = [play_bo7(qf_w[0][0], qf_w[1][0]), play_bo7(qf_w[2][0], qf_w[3][0])]
+            # Round of 16
+            r16_w = []
+            for i in range(8):
+                hi, lo = seeds[i], seeds[15-i]
+                w, hw, lw = play_bo7(hi, lo)
+                r16_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
+            
+            # Quarterfinals (Fixed tracking!)
+            qf_w = []
+            for a, b in [(0,7), (3,4), (1,6), (2,5)]:
+                hi, lo = r16_w[a][0], r16_w[b][0]
+                w, hw, lw = play_bo7(hi, lo)
+                qf_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
+            
+            # Semifinals (Fixed tracking!)
+            sf_w = []
+            for i in range(2):
+                hi, lo = qf_w[i*2][0], qf_w[i*2+1][0]
+                w, hw, lw = play_bo7(hi, lo)
+                sf_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
+            
+            # Final
             cup_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "cup_final", "Final", "Oct 26", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
             
             st.success(f"Cup Champion: **{cup_final['winner']}**")
@@ -335,7 +354,7 @@ if run_clicked:
             rounds = {"Round of 16": r16_w, "Quarterfinals": qf_w, "Semifinals": sf_w}
             for rname, rdata in rounds.items():
                 st.write(f"**{rname}**")
-                rows = [{"Matchup": f"{seeds[i]} vs {seeds[15-i]}" if rname == "Round of 16" else "...", "Winner": w, "Series": f"{hw}-{lw}"} for (w, hw, lw) in rdata]
+                rows = [{"Matchup": m, "Winner": w, "Series": s} for (w, m, s) in rdata]
                 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     # ---------------- MODE 4 (STANDALONE SOE) ----------------
@@ -343,20 +362,35 @@ if run_clicked:
         with st.spinner("Simulating SOE..."):
             subs = SubStreams(run_seed)
             t = TEAMS[:]; substream_shuffle(t, subs.get("soe_draw"))
+            
             def sim_2leg(t1, t2):
                 r1 = sim_game(t1, t2, "home", False, subs, "soe_r32", "L1", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
                 r2 = sim_game(t2, t1, "home", False, subs, "soe_r32", "L2", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
                 winner, _, _ = resolve_soe_tie(t1, t2, r1, r2, subs, "TBD")
-                return winner, r1, r2
-            
+                
+                # Format the two-legged score for display
+                a1 = r1["home_score"] + r2["away_score"]
+                a2 = r1["away_score"] + r2["home_score"]
+                agg_str = f"{a1}-{a2}"
+                if a1 == a2: agg_str += " (Away Pts)"
+                
+                return winner, f"{t1} vs {t2}", agg_str
+
             r32_w = [sim_2leg(t[i*2], t[i*2+1]) for i in range(16)]
             r16_w = [sim_2leg(r32_w[i*2][0], r32_w[i*2+1][0]) for i in range(8)]
             qf_w = [sim_2leg(r16_w[i*2][0], r16_w[i*2+1][0]) for i in range(4)]
             sf_w = [sim_2leg(qf_w[i*2][0], qf_w[i*2+1][0]) for i in range(2)]
+            
             soe_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "soe_final", "Final", "Nov 24", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
             
             st.success(f"SOE Champion: **{soe_final['winner']}**")
             st.write(f"Final: {soe_final['away_team']} ({soe_final['away_score']}) at {soe_final['home_team']} ({soe_final['home_score']})")
+            
+            rounds = {"Round of 32": r32_w, "Round of 16": r16_w, "Quarterfinals": qf_w, "Semifinals": sf_w}
+            for rname, rdata in rounds.items():
+                st.write(f"**{rname}**")
+                rows = [{"Matchup": m, "Winner": w, "Aggregate": s} for (w, m, s) in rdata]
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     # ---------------- MODE 6 & 7 (SEASON RUNNER) ----------------
     elif mode_num in [6, 7]:
