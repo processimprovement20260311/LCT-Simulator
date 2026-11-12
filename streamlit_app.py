@@ -587,12 +587,10 @@ if run_clicked:
                 
                 if format_type == "14-Team":
                     # Pick 14 is the Wildcard. They enter the bracket at Seed 4.
-                    # Seeds 5-13 stay exactly where they are.
                     seeds_dict[4] = seeds_dict[14]
                     del seeds_dict[14]
                 else:
                     # Pick 13 is the Wildcard. They enter the bracket at Seed 3.
-                    # Seeds 4-12 stay exactly where they are.
                     seeds_dict[3] = seeds_dict[13]
                     del seeds_dict[13]
 
@@ -611,7 +609,7 @@ if run_clicked:
                 # 2. Simulate Playoffs
                 seed_lk = {v: k for k, v in seeds_dict.items()}
                 
-                # Wildcard
+                # Wildcard matches (built to strictly match the dictionary keys above)
                 if format_type == "14-Team":
                     # 14-team: 3 vs 14, 4 vs 13, 5 vs 12, 6 vs 11, 7 vs 10, 8 vs 9
                     wc_pairs = [(3 + i, 14 - i) for i in range(6)]
