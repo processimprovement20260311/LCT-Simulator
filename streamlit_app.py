@@ -586,22 +586,29 @@ if run_clicked:
                 seeds_dict = {i + 1: team for i, team in enumerate(p_teams)}
                 
                 if format_type == "14-Team":
-                    # Seeds 1, 2, 3 are champs. Seed 14 is the wildcard.
-                    # Wildcard enters at Seed 4.
+                    # Pick 14 is the Wildcard. They enter the bracket at Seed 4.
+                    # Seeds 5-13 stay exactly where they are.
                     seeds_dict[4] = seeds_dict[14]
                     del seeds_dict[14]
                 else:
-                    # Seeds 1, 2, 3 are champs. No wildcard.
-                    # Seed 13 drops to Seed 3 for the 13-team bye logic.
+                    # Pick 13 is the Wildcard. They enter the bracket at Seed 3.
+                    # Seeds 4-12 stay exactly where they are.
                     seeds_dict[3] = seeds_dict[13]
                     del seeds_dict[13]
 
                 # Show Seeding Verification Table
                 st.write("### Seeding Verification")
-                seed_rows = [{"Seed": seed, "Team": team, "Role": "Champion" if seed <= 3 else ("Wildcard" if seed == 4 and format_type == "14-Team" else "At-Large")} for seed, team in sorted(seeds_dict.items())]
+                seed_rows = []
+                for seed in sorted(seeds_dict.keys()):
+                    team = seeds_dict[seed]
+                    role = "Champion" if seed <= 2 else "Wildcard/At-Large"
+                    if seed == 3 and format_type == "14-Team":
+                        role = "Champion"
+                    seed_rows.append({"Seed": seed, "Team": team, "Role": role})
+                    
                 st.dataframe(pd.DataFrame(seed_rows), hide_index=True, use_container_width=True)
 
-                # 2. Simulate Playoffs (Matching Mode 6 logic)
+                # 2. Simulate Playoffs
                 seed_lk = {v: k for k, v in seeds_dict.items()}
                 
                 # Wildcard
