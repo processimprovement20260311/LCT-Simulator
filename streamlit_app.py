@@ -583,25 +583,34 @@ if run_clicked:
                 format_type = "14-Team" if n == 14 else "13-Team"
                 
                 # 1. Build Seeding Dictionary based on selection order
-                seeds_dict = {i + 1: team for i, team in enumerate(p_teams)}
+                raw_seeds = {i + 1: team for i, team in enumerate(p_teams)}
+                seeds_dict = {}
                 
                 if format_type == "14-Team":
-                    # Pick 14 is the Wildcard. They enter the bracket at Seed 4.
-                    seeds_dict[4] = seeds_dict[14]
-                    del seeds_dict[14]
+                    # 14-Team: 1, 2, 3 are champions. 14th pick is Wildcard (Seed 4).
+                    seeds_dict[1] = raw_seeds[1]
+                    seeds_dict[2] = raw_seeds[2]
+                    seeds_dict[3] = raw_seeds[3]
+                    seeds_dict[4] = raw_seeds[14]  # Wildcard
+                    for i in range(4, 14):
+                        seeds_dict[i + 1] = raw_seeds[i] # 4->5, 5->6 ... 13->14
                 else:
-                    # Pick 13 is the Wildcard. They enter the bracket at Seed 3.
-                    seeds_dict[3] = seeds_dict[13]
-                    del seeds_dict[13]
+                    # 13-Team: 1, 2 are champions. 13th pick is Wildcard (Seed 3).
+                    seeds_dict[1] = raw_seeds[1]
+                    seeds_dict[2] = raw_seeds[2]
+                    seeds_dict[3] = raw_seeds[13]  # Wildcard
+                    for i in range(3, 13):
+                        seeds_dict[i + 1] = raw_seeds[i] # 3->4, 4->5 ... 12->13
 
                 # Show Seeding Verification Table
                 st.write("### Seeding Verification")
                 seed_rows = []
                 for seed in sorted(seeds_dict.keys()):
                     team = seeds_dict[seed]
-                    role = "Champion" if seed <= 2 else "Wildcard/At-Large"
-                    if seed == 3 and format_type == "14-Team":
-                        role = "Champion"
+                    if format_type == "14-Team":
+                        role = "Champion" if seed <= 3 else ("Wildcard" if seed == 4 else "At-Large")
+                    else:
+                        role = "Champion" if seed <= 2 else ("Wildcard" if seed == 3 else "At-Large")
                     seed_rows.append({"Seed": seed, "Team": team, "Role": role})
                     
                 st.dataframe(pd.DataFrame(seed_rows), hide_index=True, use_container_width=True)
@@ -609,13 +618,11 @@ if run_clicked:
                 # 2. Simulate Playoffs
                 seed_lk = {v: k for k, v in seeds_dict.items()}
                 
-                # Wildcard matches (built to strictly match the dictionary keys above)
+                # Wildcard matches
                 if format_type == "14-Team":
-                    # 14-team: 3 vs 14, 4 vs 13, 5 vs 12, 6 vs 11, 7 vs 10, 8 vs 9
-                    wc_pairs = [(3 + i, 14 - i) for i in range(6)]
+                    wc_pairs = [(3, 14), (4, 13), (5, 12), (6, 11), (7, 10), (8, 9)]
                 else:
-                    # 13-team: 2 vs 13, 3 vs 12, 4 vs 11, 5 vs 10, 6 vs 9, 7 vs 8
-                    wc_pairs = [(2 + i, 13 - i) for i in range(6)]
+                    wc_pairs = [(2, 13), (3, 12), (4, 11), (5, 10), (6, 9), (7, 8)]
                 
                 wc_games = [sim_game(seeds_dict[hi], seeds_dict[lo], "home", True, subs, "playoff_wc", "WC", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()) for hi, lo in wc_pairs]
                 wc_w = [r["winner"] for r in wc_games]
@@ -634,7 +641,7 @@ if run_clicked:
                 
                 div_w = [r["winner"] for r in div_games]
                 if format_type == "13-Team":
-                    div_w = [seeds_dict[1]] + div_w  # Seed 1 gets the bye here
+                    div_w = [seeds_dict[1]] + div_w  # Seed 1 gets the double bye here
                 
                 # Bracket Championship
                 bc_srt = sorted(div_w, key=lambda x: seed_lk[x])
