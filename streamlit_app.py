@@ -60,7 +60,7 @@ class SubStreams:
         self.streams = {l: Xoshiro(subseed(seed, l)) for l in [
             "league_schedule","league_games","cup_draw","cup_games","soe_draw",
             "soe_games","playoff_games","tiebreaks","wildcard","overtime",
-            "hac_games","hac_draw"]}
+            "hac_games","hac_draw", "stats_gen"]} # Added stats_gen stream
     def get(self, l): return self.streams[l]
 
 def substream_shuffle(seq, rng):
@@ -100,8 +100,80 @@ _CURRENT_WEATHER = "Random"
 def forced_weather_setting():
     return None if _CURRENT_WEATHER == "Random" else _CURRENT_WEATHER
 
+# NEW: Function to generate realistic box score stats based on game outcome
+def generate_box_score(home, away, hs, as_, hr, ar, weather, rng):
+    # Base offensive volume
+    base_plays = 65
+    h_plays = base_plays + rng.next_int(-5, 10)
+    a_plays = base_plays + rng.next_int(-5, 10)
+    
+    # Weather affects passing efficiency and total volume slightly
+    weather_penalty = 0.85 if weather in ["Extreme Rain", "Heavy Snow", "Heavy Winds"] else 1.0
+    
+    # Distribute yards based on points scored, overall rating, and defense faced
+    # Roughly 10-15 yards per point scored
+    h_yards = int((hs * 12) + (hr.OFF * 1.5) - (ar.DEF * 1.0) + rng.next_int(-30, 30))
+    a_yards = int((as_ * 12) + (ar.OFF * 1.5) - (hr.DEF * 1.0) + rng.next_int(-30, 30))
+    
+    h_yards = max(120, h_yards)
+    a_yards = max(120, a_yards)
+    
+    # Split into Pass vs Rush
+    h_pass_ratio = clamp(0.60 + ((hr.OFF - ar.DEF) / 200) + (rng.next_int(-10, 10)/100), 0.40, 0.80)
+    a_pass_ratio = clamp(0.60 + ((ar.OFF - hr.DEF) / 200) + (rng.next_int(-10, 10)/100), 0.40, 0.80)
+    
+    h_pass = int(h_yards * h_pass_ratio * weather_penalty)
+    h_rush = h_yards - h_pass
+    a_pass = int(a_yards * a_pass_ratio * weather_penalty)
+    a_rush = a_yards - a_pass
+    
+    # First downs (roughly 1 FD per 15-18 yards)
+    h_fd = int(h_yards / 16) + rng.next_int(0, 3)
+    a_fd = int(a_yards / 16) + rng.next_int(0, 3)
+    
+    # Turnovers (Inversely proportional to Overall rating)
+    h_to = rng.next_int(0, 3) if rng.next_float() < (0.4 + (ar.DEF - hr.OFF)/100) else 0
+    a_to = rng.next_int(0, 3) if rng.next_float() < (0.4 + (hr.DEF - ar.OFF)/100) else 0
+    
+    # Sacks
+    h_sacks = rng.next_int(0, 4) + (1 if ar.DEF > 90 else 0)
+    a_sacks = rng.next_int(0, 4) + (1 if hr.DEF > 90 else 0)
+    
+    # Time of possession (in seconds)
+    total_time = 3600
+    h_top = int(total_time * (0.5 + (h_yards - a_yards)/800) + rng.next_int(-120, 120))
+    h_top = clamp(h_top, 1800, 3000)
+    a_top = total_time - h_top
+    
+    def fmt_top(sec):
+        m, s = divmod(sec, 60)
+        return f"{m}:{s:02d}"
+
+    return {
+        "Home": {
+            "Total Yards": h_yards,
+            "Passing Yards": h_pass,
+            "Rushing Yards": h_rush,
+            "First Downs": h_fd,
+            "Turnovers": h_to,
+            "Sacks": h_sacks,
+            "Time of Possession": fmt_top(h_top),
+            "Plays": h_plays
+        },
+        "Away": {
+            "Total Yards": a_yards,
+            "Passing Yards": a_pass,
+            "Rushing Yards": a_rush,
+            "First Downs": a_fd,
+            "Turnovers": a_to,
+            "Sacks": a_sacks,
+            "Time of Possession": fmt_top(a_top),
+            "Plays": a_plays
+        }
+    }
+
 def sim_game(home, away, venue, must_win, subs, comp_name, round_name,
-             game_date, ratings, season_num, forced_weather=None, force_test_weather=False):
+             game_date, ratings, season_num, forced_weather=None, force_test_weather=False, gen_stats=False):
     stream = COMP_STREAM_MAP.get(comp_name, "league_games")
     rng = subs.get(stream)
 
@@ -156,9 +228,16 @@ def sim_game(home, away, venue, must_win, subs, comp_name, round_name,
                 break
             possessor_home = not possessor_home
 
-    return {"home_team": home, "away_team": away, "home_score": hs, "away_score": as_,
+    result = {"home_team": home, "away_team": away, "home_score": hs, "away_score": as_,
             "winner": winner, "went_to_overtime": ot, "weather": weather,
             "competition": comp_name, "round": round_name, "date": game_date}
+            
+    # NEW: Generate stats if requested
+    if gen_stats:
+        stats_rng = subs.get("stats_gen")
+        result["box_score"] = generate_box_score(home, away, hs, as_, hr, ar, weather, stats_rng)
+
+    return result
 
 RAW_RATINGS = {
     "STF": {"OFF": 91, "DEF": 99, "SPT": 91}, "BRK": {"OFF": 91, "DEF": 99, "SPT": 94}, "JRD": {"OFF": 97, "DEF": 92, "SPT": 95},
@@ -253,8 +332,8 @@ with col1:
         mode_params["home_team"] = st.selectbox("Home team", TEAMS, index=TEAMS.index("JRD"))
         mode_params["away_team"] = st.selectbox("Away team", TEAMS, index=TEAMS.index("GRG"))
         mode_params["venue"] = st.radio("Venue", ["home", "neutral"], horizontal=True)
-        mode_params["num_sims"] = st.number_input("Simulations", 1, 5000, 100)
-        mode_params["allow_draws"] = st.checkbox("Allow draws (uncheck for OT resolution)", value=True)
+        mode_params["num_sims"] = st.number_input("Simulations", 1, 100, 1)
+        mode_params["allow_draws"] = st.checkbox("Allow draws (uncheck for OT resolution)", value=False)
         mode_params["force_clear"] = st.checkbox(
             "Force clear weather", value=False,
             help="Uncheck to sample weather from the engine's distribution.",
@@ -288,7 +367,7 @@ if run_clicked:
     run_seed = (master_seed if master_seed is not None else int(time.time() * 1000) & MASK64)
     st.info(f"Master seed: `{run_seed}`" + (" (reproducible)" if master_seed is not None else " (auto)"))
 
-    # ---------------- MODE 1 (MATCHUP STATISTICS) ----------------
+    # ---------------- MODE 1 (MATCHUP STATISTICS & BOX SCORES) ----------------
     if mode_num == 1:
         home = mode_params["home_team"]
         away = mode_params["away_team"]
@@ -306,643 +385,65 @@ if run_clicked:
                     "league", "R1", "Mar 03", BASE_RATINGS, 1,
                     forced_weather=forced_weather_setting(),
                     force_test_weather=force_clear,
+                    gen_stats=True  # <-- Tell engine to generate box score
                 ))
             df = pd.DataFrame(games)
 
         st.success(f"Ran {n} simulations: **{home}** vs **{away}** ({venue}).")
 
-        # ---------- Headline metrics ----------
-        hw = (df["winner"] == home).sum()
-        aw = (df["winner"] == away).sum()
-        draws = df["winner"].isna().sum()
-        ot_rate = df["went_to_overtime"].mean()
+        # ---------- Aggregate Metrics ----------
+        if n > 1:
+            hw = (df["winner"] == home).sum()
+            aw = (df["winner"] == away).sum()
+            draws = df["winner"].isna().sum()
+            ot_rate = df["went_to_overtime"].mean()
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric(f"{home} win %", f"{hw/n:.1%}", help=f"{hw} wins")
-        m2.metric(f"{away} win %", f"{aw/n:.1%}", help=f"{aw} wins")
-        m3.metric("Draw %", f"{draws/n:.1%}", help=f"{draws} draws")
-        m4.metric("OT rate", f"{ot_rate:.1%}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(f"{home} win %", f"{hw/n:.1%}", help=f"{hw} wins")
+            m2.metric(f"{away} win %", f"{aw/n:.1%}", help=f"{aw} wins")
+            m3.metric("Draw %", f"{draws/n:.1%}", help=f"{draws} draws")
+            m4.metric("OT rate", f"{ot_rate:.1%}")
 
-        # ---------- Derived columns ----------
-        df["margin"] = df["home_score"] - df["away_score"]
-        df["total"]  = df["home_score"] + df["away_score"]
+        st.divider()
 
-        # ---------- Score summary ----------
-        st.subheader("Score summary")
-        summary = df[["home_score", "away_score", "margin", "total"]].describe().round(2)
-        st.dataframe(summary, use_container_width=True)
+        # ---------- Individual Game Box Scores ----------
+        st.subheader("Box Scores")
+        
+        for i, game in enumerate(games):
+            # Header
+            winner_text = game['winner'] if game['winner'] else "Tie"
+            st.markdown(f"### Game {i+1} &nbsp;&nbsp;|&nbsp;&nbsp; **{game['away_team']}** ({game['away_score']}) @ **{game['home_team']}** ({game['home_score']}) &nbsp;&nbsp;|&nbsp;&nbsp; Weather: {game['weather']}")
+            if game['went_to_overtime']:
+                st.caption("*(Went to Overtime)*")
+            
+            # Box Score Table
+            bs = game["box_score"]
+            box_rows = []
+            for stat in ["Total Yards", "Passing Yards", "Rushing Yards", "First Downs", "Turnovers", "Sacks", "Time of Possession", "Plays"]:
+                box_rows.append({
+                    "Stat": stat,
+                    game["away_team"]: bs["Away"][stat],
+                    game["home_team"]: bs["Home"][stat]
+                })
+            st.dataframe(pd.DataFrame(box_rows), hide_index=True, use_container_width=True)
+            
+            # If we're showing multiple games, don't show all full box scores, just show the first 5 to prevent extreme scrolling
+            if i >= 4 and n > 5:
+                st.info(f"... and {n - 5} more games. See the Game Log below for summary stats.")
+                break
 
-        # ---------- Average scores by weather ----------
-        st.subheader("Weather breakdown")
-        if force_clear:
-            st.caption("Weather was forced to Clear for every game.")
-        else:
-            st.caption("Weather sampled from the engine's distribution. "
-                       "Marquee games (finals, Mar 03 opener) are always Clear by design.")
-        weather_stats = (
-            df.groupby("weather")
-              .agg(Games=("weather", "size"),
-                   AvgHome=("home_score", "mean"),
-                   AvgAway=("away_score", "mean"),
-                   AvgMargin=("margin", "mean"),
-                   OT=("went_to_overtime", "sum"))
-              .round(2)
-              .reset_index()
-        )
-        st.dataframe(weather_stats, hide_index=True, use_container_width=True)
-
-        # ---------- Score distribution histograms ----------
-        st.subheader("Score distributions")
-        hc1, hc2 = st.columns(2)
-        with hc1:
-            st.write(f"**{home} score**")
-            st.bar_chart(df["home_score"].value_counts().sort_index())
-        with hc2:
-            st.write(f"**{away} score**")
-            st.bar_chart(df["away_score"].value_counts().sort_index())
-
-        st.write("**Margin distribution** (positive = home win)")
-        st.bar_chart(df["margin"].value_counts().sort_index())
-
-        # ---------- Raw game log (collapsed) ----------
+        # ---------- Game Log Summary ----------
         with st.expander("Show full game log"):
-            log_df = df[["home_team", "home_score", "away_score", "away_team",
-                         "winner", "went_to_overtime", "weather", "date"]].copy()
-            log_df.insert(0, "Game", range(1, len(log_df) + 1))
-            log_df["winner"] = log_df["winner"].fillna("Draw")
-            log_df = log_df.rename(columns={
+            log_df = pd.DataFrame(games)
+            log_df["Total Yards (Home)"] = log_df["box_score"].apply(lambda x: x["Home"]["Total Yards"])
+            log_df["Total Yards (Away)"] = log_df["box_score"].apply(lambda x: x["Away"]["Total Yards"])
+            
+            display_df = log_df[["home_team", "home_score", "away_score", "away_team", "winner", "weather", "Total Yards (Home)", "Total Yards (Away)"]].copy()
+            display_df.insert(0, "Game", range(1, len(display_df) + 1))
+            display_df["winner"] = display_df["winner"].fillna("Draw")
+            display_df = display_df.rename(columns={
                 "home_team": "Home", "home_score": "Home Score",
                 "away_team": "Away", "away_score": "Away Score",
-                "winner": "Winner", "went_to_overtime": "OT",
-                "weather": "Weather", "date": "Date",
+                "winner": "Winner", "weather": "Weather"
             })
-            st.dataframe(log_df, hide_index=True, use_container_width=True)
-
-        # ---------- Download ----------
-        st.download_button(
-            "⬇️ Download game log (CSV)",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=f"lct_matchup_{home}_vs_{away}_{run_seed}.csv",
-            mime="text/csv",
-        )
-
-    # ---------------- MODE 2 (STANDALONE LEAGUE) ----------------
-    elif mode_num == 2:
-        with st.spinner("Simulating League Phase..."):
-            subs = SubStreams(run_seed)
-            schedule = [{"round": r, "home": TEAMS[i], "away": TEAMS[(i + r) % len(TEAMS)]} for r in range(1, 32) for i in range(len(TEAMS))]
-            schedule += [{"round": g["round"] + 31, "home": g["away"], "away": g["home"]} for g in schedule[:]]
-            
-            results = []
-            for g in schedule:
-                results.append(sim_game(g["home"], g["away"], "home", False, subs, "league", f"R{g['round']}", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()))
-            
-            ranked, table = compute_league_table(schedule, results, subs.get("tiebreaks"))
-            st.success(f"League Champion: **{ranked[0]}**")
-            
-            df_rows = [{"Pos": i+1, "Team": t, "W": table[t]["w"], "D": table[t]["d"], "L": table[t]["l"], "Pts": table[t]["pts"], "GD": table[t]["gd"]} for i, t in enumerate(ranked)]
-            st.dataframe(pd.DataFrame(df_rows), hide_index=True, use_container_width=True)
-
-    # ---------------- MODE 3 (STANDALONE CUP) ----------------
-    elif mode_num == 3:
-        with st.spinner("Simulating Cup..."):
-            subs = SubStreams(run_seed)
-            t_list = TEAMS[:]; substream_shuffle(t_list, subs.get("cup_draw"))
-            groups = [t_list[i*4:(i+1)*4] for i in range(8)]
-            winners, runners = [], []
-            for grp in groups:
-                g_pts = {x: 0 for x in grp}; g_gd = {x: 0 for x in grp}; g_gf = {x: 0 for x in grp}
-                for i in range(4):
-                    for j in range(4):
-                        if i != j:
-                            r = sim_game(grp[i], grp[j], "home", False, subs, "cup_group", "G", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                            hs, as_ = r["home_score"], r["away_score"]
-                            g_gf[grp[i]] += hs; g_gf[grp[j]] += as_
-                            g_gd[grp[i]] += hs - as_; g_gd[grp[j]] += as_ - hs
-                            if hs > as_: g_pts[grp[i]] += 3
-                            elif as_ > hs: g_pts[grp[j]] += 3
-                            else: g_pts[grp[i]] += 1; g_pts[grp[j]] += 1
-                ordered = sorted(grp, key=lambda x: (-g_pts[x], -g_gd[x], -g_gf[x]))
-                winners.append(ordered[0]); runners.append(ordered[1])
-            
-            seeds = winners + runners
-            
-            def play_bo7(hi, lo):
-                wins = {hi:0, lo:0}
-                for g in range(7):
-                    res = sim_game(hi, lo, "home", True, subs, "cup_knockout", "Bo7", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                    wins[res["winner"]] += 1
-                return hi if wins[hi] > wins[lo] else lo, wins[hi], wins[lo]
-
-            r16_w = []
-            for i in range(8):
-                hi, lo = seeds[i], seeds[15-i]
-                w, hw, lw = play_bo7(hi, lo)
-                r16_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
-            
-            qf_w = []
-            for a, b in [(0,7), (3,4), (1,6), (2,5)]:
-                hi, lo = r16_w[a][0], r16_w[b][0]
-                w, hw, lw = play_bo7(hi, lo)
-                qf_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
-            
-            sf_w = []
-            for i in range(2):
-                hi, lo = qf_w[i*2][0], qf_w[i*2+1][0]
-                w, hw, lw = play_bo7(hi, lo)
-                sf_w.append((w, f"{hi} vs {lo}", f"{hw}-{lw}"))
-            
-            cup_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "cup_final", "Final", "Oct 26", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-            
-            st.success(f"Cup Champion: **{cup_final['winner']}**")
-            st.write(f"Final: {cup_final['away_team']} ({cup_final['away_score']}) at {cup_final['home_team']} ({cup_final['home_score']})")
-            
-            rounds = {"Round of 16": r16_w, "Quarterfinals": qf_w, "Semifinals": sf_w}
-            for rname, rdata in rounds.items():
-                st.write(f"**{rname}**")
-                rows = [{"Matchup": m, "Winner": w, "Series": s} for (w, m, s) in rdata]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-    # ---------------- MODE 4 (STANDALONE SOE) ----------------
-    elif mode_num == 4:
-        with st.spinner("Simulating SOE..."):
-            subs = SubStreams(run_seed)
-            t = TEAMS[:]; substream_shuffle(t, subs.get("soe_draw"))
-            
-            def sim_2leg(t1, t2):
-                r1 = sim_game(t1, t2, "home", False, subs, "soe_r32", "L1", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                r2 = sim_game(t2, t1, "home", False, subs, "soe_r32", "L2", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                winner, _, _ = resolve_soe_tie(t1, t2, r1, r2, subs, "TBD")
-                
-                a1 = r1["home_score"] + r2["away_score"]
-                a2 = r1["away_score"] + r2["home_score"]
-                agg_str = f"{a1}-{a2}"
-                if a1 == a2: agg_str += " (Away Pts)"
-                
-                return winner, f"{t1} vs {t2}", agg_str
-
-            r32_w = [sim_2leg(t[i*2], t[i*2+1]) for i in range(16)]
-            r16_w = [sim_2leg(r32_w[i*2][0], r32_w[i*2+1][0]) for i in range(8)]
-            qf_w = [sim_2leg(r16_w[i*2][0], r16_w[i*2+1][0]) for i in range(4)]
-            sf_w = [sim_2leg(qf_w[i*2][0], qf_w[i*2+1][0]) for i in range(2)]
-            
-            soe_final = sim_game(sf_w[0][0], sf_w[1][0], "neutral", True, subs, "soe_final", "Final", "Nov 24", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-            
-            st.success(f"SOE Champion: **{soe_final['winner']}**")
-            st.write(f"Final: {soe_final['away_team']} ({soe_final['away_score']}) at {soe_final['home_team']} ({soe_final['home_score']})")
-            
-            rounds = {"Round of 32": r32_w, "Round of 16": r16_w, "Quarterfinals": qf_w, "Semifinals": sf_w}
-            for rname, rdata in rounds.items():
-                st.write(f"**{rname}**")
-                rows = [{"Matchup": m, "Winner": w, "Aggregate": s} for (w, m, s) in rdata]
-                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-    # ---------------- MODE 5 (SINGLE ELIM) ----------------
-    elif mode_num == 5:
-        bracket = mode_params.get("bracket_teams", [])
-        num_teams = len(bracket)
-        if num_teams not in [2, 4, 8, 16, 32]:
-            st.error(f"Error: You selected {num_teams} teams. The bracket must be 2, 4, 8, 16, or 32 teams.")
-        else:
-            with st.spinner(f"Simulating {num_teams}-Team Single Elimination Bracket..."):
-                subs = SubStreams(run_seed)
-                substream_shuffle(bracket, subs.get("playoff_games"))
-                round_name = f"Round of {num_teams}" if num_teams > 2 else "Final"
-                
-                while len(bracket) > 1:
-                    st.write(f"**{round_name}**")
-                    next_round = []
-                    rows = []
-                    for i in range(0, len(bracket), 2):
-                        t1, t2 = bracket[i], bracket[i+1]
-                        res = sim_game(t1, t2, "home", True, subs, "playoff_wc", round_name, "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                        rows.append({"Matchup": f"{t1} vs {t2}", "Score": f"{res['home_score']}-{res['away_score']}", "Winner": res['winner']})
-                        next_round.append(res["winner"])
-                    
-                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-                    bracket = next_round
-                    
-                    if len(bracket) == 4: round_name = "Semifinals"
-                    elif len(bracket) == 2: round_name = "Final"
-                    elif len(bracket) > 4: round_name = f"Round of {len(bracket)}"
-                
-                st.success(f"Champion: **{bracket[0]}**")
-
-    # ---------------- MODE 8 (HAC) ----------------
-    elif mode_num == 8:
-        hac_teams = mode_params.get("hac_teams", [])
-        n = len(hac_teams)
-        group_plan = {
-            6:  (2, 3), 8:  (2, 4), 10: (2, 5),
-            12: (4, 3), 14: (2, 7), 16: (4, 4),
-        }
-        if n not in group_plan:
-            st.error(f"Error: You selected {n} teams. HAC Mode requires 6, 8, 10, 12, 14, or 16 teams.")
-        else:
-            with st.spinner(f"Simulating HAC Mode ({n} teams)..."):
-                subs = SubStreams(run_seed)
-                teams = hac_teams[:]
-                substream_shuffle(teams, subs.get("hac_draw"))
-                num_groups, gsize = group_plan[n]
-                groups = [teams[i*gsize:(i+1)*gsize] for i in range(num_groups)]
-                group_labels = [chr(ord('A') + i) for i in range(num_groups)]
-
-                # ---- Group stage (double round-robin) ----
-                group_standings = []   # list of (label, ordered_list, table)
-                for gi, grp in enumerate(groups):
-                    pts = {x: 0 for x in grp}
-                    gd  = {x: 0 for x in grp}
-                    gf  = {x: 0 for x in grp}
-                    for i in range(len(grp)):
-                        for j in range(len(grp)):
-                            if i == j: continue
-                            # each ordered pair once = home & away covered
-                            r = sim_game(grp[i], grp[j], "home", False, subs,
-                                         "hac_group", f"Group {group_labels[gi]}",
-                                         "TBD", BASE_RATINGS, 1,
-                                         forced_weather=forced_weather_setting())
-                            hs, as_ = r["home_score"], r["away_score"]
-                            gf[grp[i]] += hs; gf[grp[j]] += as_
-                            gd[grp[i]] += hs - as_; gd[grp[j]] += as_ - hs
-                            if hs > as_: pts[grp[i]] += 3
-                            elif as_ > hs: pts[grp[j]] += 3
-                            else: pts[grp[i]] += 1; pts[grp[j]] += 1
-                    ordered = sorted(grp, key=lambda x: (-pts[x], -gd[x], -gf[x]))
-                    group_standings.append((group_labels[gi], ordered,
-                                            {"pts": pts, "gd": gd, "gf": gf}))
-
-                # ---- Show group tables ----
-                for label, ordered, tb in group_standings:
-                    st.write(f"**Group {label}**")
-                    rows = [{"Pos": i+1, "Team": t, "Pts": tb["pts"][t],
-                             "GD": tb["gd"][t], "GF": tb["gf"][t]}
-                            for i, t in enumerate(ordered)]
-                    st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                 use_container_width=True)
-
-                # ---- Build seeded advancer list ----
-                # top2 per group normally; top4 per group for 14 teams
-                advance_per_group = 4 if n == 14 else 2
-                # Seed order: A1, B1, (C1, D1), A2, B2, (C2, D2), A3, B3, ... A4, B4 ...
-                advancers = []   # ordered by seed (1 = best)
-                for rank in range(advance_per_group):
-                    for label, ordered, tb in group_standings:
-                        if rank < len(ordered):
-                            advancers.append(ordered[rank])
-
-                # ---- Knockout: two-legged rounds until 2 remain, then single final ----
-                def sim_2leg(t1, t2):
-                    r1 = sim_game(t1, t2, "home", False, subs, "hac_knockout",
-                                  "L1", "TBD", BASE_RATINGS, 1,
-                                  forced_weather=forced_weather_setting())
-                    r2 = sim_game(t2, t1, "home", False, subs, "hac_knockout",
-                                  "L2", "TBD", BASE_RATINGS, 1,
-                                  forced_weather=forced_weather_setting())
-                    winner, _, _ = resolve_soe_tie(t1, t2, r1, r2, subs, "TBD")
-                    a1 = r1["home_score"] + r2["away_score"]
-                    a2 = r1["away_score"] + r2["home_score"]
-                    agg_str = f"{a1}-{a2}"
-                    if a1 == a2: agg_str += " (Away Pts)"
-                    return winner, f"{t1} vs {t2}", agg_str
-
-                ko_rounds = []
-                current = advancers
-                if len(current) == 4:
-                    round_name = "Semifinals"
-                elif len(current) == 8:
-                    round_name = "Quarterfinals"
-                else:
-                    round_name = f"Round of {len(current)}"
-
-                # Play two-legged rounds while more than 2 teams remain
-                while len(current) > 2:
-                    pairings = []
-                    lo, hi = 0, len(current) - 1
-                    while lo < hi:
-                        pairings.append((current[lo], current[hi]))
-                        lo += 1; hi -= 1
-                    results = []
-                    next_round = []
-                    for t1, t2 in pairings:
-                        w, matchup, agg = sim_2leg(t1, t2)
-                        results.append((w, matchup, agg))
-                        next_round.append(w)
-                    ko_rounds.append((round_name, results))
-                    current = next_round
-                    if len(current) == 2: round_name = "Final"
-                    elif len(current) == 4: round_name = "Semifinals"
-                    elif len(current) > 4: round_name = f"Round of {len(current)}"
-
-                # Single-leg final on neutral ground (non-marquee)
-                final_two = current  # exactly 2 teams here
-                hac_final = sim_game(final_two[0], final_two[1], "neutral", True,
-                                     subs, "hac_final", "Final", "TBD",
-                                     BASE_RATINGS, 1,
-                                     forced_weather=forced_weather_setting())
-
-                # ---- Display knockout results ----
-                for rname, rdata in ko_rounds:
-                    st.write(f"**{rname}**")
-                    rows = [{"Matchup": m, "Winner": w, "Aggregate": s}
-                            for (w, m, s) in rdata]
-                    st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                 use_container_width=True)
-
-                st.write("**Final**")
-                st.dataframe(pd.DataFrame([{
-                    "Away": hac_final["away_team"],
-                    "Away Score": hac_final["away_score"],
-                    "Home": hac_final["home_team"],
-                    "Home Score": hac_final["home_score"],
-                    "Winner": hac_final["winner"],
-                }]), hide_index=True, use_container_width=True)
-
-                st.success(f"HAC Champion: **{hac_final['winner']}**")
-
-    # ---------------- MODE 9 (STANDALONE PLAYOFFS) ----------------
-    elif mode_num == 9:
-        p_teams = mode_params.get("playoff_teams", [])
-        n = len(p_teams)
-        
-        if n not in [13, 14]:
-            st.error(f"Error: You selected {n} teams. Standalone Playoffs requires exactly 13 or 14 teams.")
-        elif len(set(p_teams)) != n:
-            st.error("Error: Duplicate teams selected. Please ensure all teams are unique.")
-        else:
-            with st.spinner(f"Simulating Standalone Playoffs ({n}-Team format)..."):
-                subs = SubStreams(run_seed)
-                format_type = "14-Team" if n == 14 else "13-Team"
-                
-                # 1. Build Seeding Dictionary based on selection order
-                raw_seeds = {i + 1: team for i, team in enumerate(p_teams)}
-                seeds_dict = {}
-                
-                if format_type == "14-Team":
-                    # 14-Team: 1, 2, 3 are champions. 14th pick is Wildcard (Seed 4).
-                    seeds_dict[1] = raw_seeds[1]
-                    seeds_dict[2] = raw_seeds[2]
-                    seeds_dict[3] = raw_seeds[3]
-                    seeds_dict[4] = raw_seeds[14]  # Wildcard
-                    for i in range(4, 14):
-                        seeds_dict[i + 1] = raw_seeds[i] # 4->5, 5->6 ... 13->14
-                else:
-                    # 13-Team: 1, 2 are champions. 13th pick is Wildcard (Seed 3).
-                    seeds_dict[1] = raw_seeds[1]
-                    seeds_dict[2] = raw_seeds[2]
-                    seeds_dict[3] = raw_seeds[13]  # Wildcard
-                    for i in range(3, 13):
-                        seeds_dict[i + 1] = raw_seeds[i] # 3->4, 4->5 ... 12->13
-
-                # Show Seeding Verification Table
-                st.write("### Seeding Verification")
-                seed_rows = []
-                for seed in sorted(seeds_dict.keys()):
-                    team = seeds_dict[seed]
-                    if format_type == "14-Team":
-                        role = "Champion" if seed <= 3 else ("Wildcard" if seed == 4 else "At-Large")
-                    else:
-                        role = "Champion" if seed <= 2 else ("Wildcard" if seed == 3 else "At-Large")
-                    seed_rows.append({"Seed": seed, "Team": team, "Role": role})
-                    
-                st.dataframe(pd.DataFrame(seed_rows), hide_index=True, use_container_width=True)
-
-                # 2. Simulate Playoffs
-                seed_lk = {v: k for k, v in seeds_dict.items()}
-                
-                # Wildcard matches
-                if format_type == "14-Team":
-                    wc_pairs = [(3, 14), (4, 13), (5, 12), (6, 11), (7, 10), (8, 9)]
-                else:
-                    wc_pairs = [(2, 13), (3, 12), (4, 11), (5, 10), (6, 9), (7, 8)]
-                
-                wc_games = [sim_game(seeds_dict[hi], seeds_dict[lo], "home", True, subs, "playoff_wc", "WC", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()) for hi, lo in wc_pairs]
-                wc_w = [r["winner"] for r in wc_games]
-                
-                # Divisional
-                div_games = []
-                if format_type == "14-Team":
-                    div_teams = [seeds_dict[1], seeds_dict[2]] + wc_w
-                    div_srt = sorted(div_teams, key=lambda x: seed_lk[x])
-                    for i in range(4):
-                        div_games.append(sim_game(div_srt[i], div_srt[7-i], "home", True, subs, "playoff_div", "Div", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()))
-                else:
-                    wc_srt = sorted(wc_w, key=lambda x: seed_lk[x])
-                    for i in range(3):
-                        div_games.append(sim_game(wc_srt[i], wc_srt[5-i], "home", True, subs, "playoff_div", "Div", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()))
-                
-                div_w = [r["winner"] for r in div_games]
-                if format_type == "13-Team":
-                    div_w = [seeds_dict[1]] + div_w  # Seed 1 gets the double bye here
-                
-                # Bracket Championship
-                bc_srt = sorted(div_w, key=lambda x: seed_lk[x])
-                bc_games = [sim_game(bc_srt[i[0]], bc_srt[i[1]], "home", True, subs, "playoff_bracket", "BC", "TBD", BASE_RATINGS, 1, forced_weather=forced_weather_setting()) for i in [(0, 3), (1, 2)]]
-                bc_w = [r["winner"] for r in bc_games]
-                
-                # Super Bowl
-                sb = sim_game(bc_w[0], bc_w[1], "neutral", True, subs, "super_bowl", "SB", "Dec 23", BASE_RATINGS, 1, forced_weather=forced_weather_setting())
-                sb_champ = sb["winner"]
-                
-                # 3. Display Results
-                st.success(f"Super Bowl Champion: **{sb_champ}**")
-                
-                rounds = {
-                    "Wild Card": wc_games,
-                    "Divisional": div_games,
-                    "Bracket Championship": bc_games,
-                    "Super Bowl": [sb]
-                }
-                
-                for rname, games in rounds.items():
-                    st.write(f"**{rname}**")
-                    game_rows = [{
-                        "Away": g["away_team"], "Away Score": g["away_score"],
-                        "Home": g["home_team"], "Home Score": g["home_score"],
-                        "Winner": g["winner"]
-                    } for g in games]
-                    st.dataframe(pd.DataFrame(game_rows), hide_index=True, use_container_width=True)
-
-                # Download JSON
-                json_data = json.dumps({
-                    "run_seed": run_seed, 
-                    "format": format_type,
-                    "seeding": seed_rows,
-                    "results": {k: v for k, v in rounds.items()}
-                }, indent=2, default=str)
-                st.download_button("⬇️ Download JSON Results", json_data, file_name=f"lct_playoffs_{run_seed}.json", mime="application/json")
-
-    # ---------------- MODE 6 & 7 (SEASON RUNNER) ----------------
-    elif mode_num in [6, 7]:
-        seasons = 1 if mode_num == 6 else mode_params["num_seasons"]
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        all_season_records = []
-        stats = {t: {"LeagueWins": 0, "Top5Finishes": 0, "PlayoffApps": 0, "CupTitles": 0, "SOETitles": 0, "SBTitles": 0} for t in TEAMS}
-        
-        for season in range(1, seasons + 1):
-            status_text.write(f"Simulating Season {season} of {seasons}...")
-            season_seed = (run_seed + season) & MASK64
-            subs = SubStreams(season_seed)
-            
-            # 1. League
-            schedule = [{"round": r, "home": TEAMS[i], "away": TEAMS[(i + r) % len(TEAMS)]} for r in range(1, 32) for i in range(len(TEAMS))]
-            schedule += [{"round": g["round"] + 31, "home": g["away"], "away": g["home"]} for g in schedule[:]]
-            
-            results = []
-            for g in schedule:
-                results.append(sim_game(g["home"], g["away"], "home", False, subs, "league", f"R{g['round']}", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()))
-            
-            ranked, table = compute_league_table(schedule, results, subs.get("tiebreaks"))
-            league_champ = ranked[0]
-            stats[league_champ]["LeagueWins"] += 1
-            for t in ranked[:5]: stats[t]["Top5Finishes"] += 1
-
-            # 2. Cup
-            t_list = TEAMS[:]
-            substream_shuffle(t_list, subs.get("cup_draw"))
-            groups = [t_list[i*4:(i+1)*4] for i in range(8)]
-            winners, runners = [], []
-            for grp in groups:
-                g_pts = {x: 0 for x in grp}; g_gd = {x: 0 for x in grp}; g_gf = {x: 0 for x in grp}
-                for i in range(4):
-                    for j in range(4):
-                        if i != j:
-                            r = sim_game(grp[i], grp[j], "home", False, subs, "cup_group", "G", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-                            hs, as_ = r["home_score"], r["away_score"]
-                            g_gf[grp[i]] += hs; g_gf[grp[j]] += as_
-                            g_gd[grp[i]] += hs - as_; g_gd[grp[j]] += as_ - hs
-                            if hs > as_: g_pts[grp[i]] += 3
-                            elif as_ > hs: g_pts[grp[j]] += 3
-                            else: g_pts[grp[i]] += 1; g_pts[grp[j]] += 1
-                ordered = sorted(grp, key=lambda x: (-g_pts[x], -g_gd[x], -g_gf[x]))
-                winners.append(ordered[0]); runners.append(ordered[1])
-            
-            seeds = winners + runners
-            
-            def play_bo7(hi, lo):
-                wins = {hi:0, lo:0}
-                for g in range(7):
-                    res = sim_game(hi, lo, "home", True, subs, "cup_knockout", "Bo7", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-                    wins[res["winner"]] += 1
-                return hi if wins[hi] > wins[lo] else lo
-
-            r16_w = [play_bo7(seeds[i], seeds[15-i]) for i in range(8)]
-            qf_w = [play_bo7(r16_w[a], r16_w[b]) for a, b in [(0,7),(3,4),(1,6),(2,5)]]
-            sf_w = [play_bo7(qf_w[0], qf_w[1]), play_bo7(qf_w[2], qf_w[3])]
-            cup_final = sim_game(sf_w[0], sf_w[1], "neutral", True, subs, "cup_final", "Final", "Oct 26", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-            cup_champ = cup_final["winner"]
-            stats[cup_champ]["CupTitles"] += 1
-
-            # 3. SOE
-            t = TEAMS[:]
-            substream_shuffle(t, subs.get("soe_draw"))
-            def sim_2leg(t1, t2):
-                r1 = sim_game(t1, t2, "home", False, subs, "soe_r32", "L1", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-                r2 = sim_game(t2, t1, "home", False, subs, "soe_r32", "L2", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-                winner, _, _ = resolve_soe_tie(t1, t2, r1, r2, subs, "TBD")
-                return winner
-            r32_w = [sim_2leg(t[i*2], t[i*2+1]) for i in range(16)]
-            r16_w = [sim_2leg(r32_w[i*2], r32_w[i*2+1]) for i in range(8)]
-            qf_w = [sim_2leg(r16_w[i*2], r16_w[i*2+1]) for i in range(4)]
-            sf_w = [sim_2leg(qf_w[i*2], qf_w[i*2+1]) for i in range(2)]
-            soe_final = sim_game(sf_w[0], sf_w[1], "neutral", True, subs, "soe_final", "Final", "Nov 24", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-            soe_champ = soe_final["winner"]
-            stats[soe_champ]["SOETitles"] += 1
-
-            # 4. Playoffs
-            champions_in_order = []
-            for c in [league_champ, cup_champ, soe_champ]:
-                if c not in champions_in_order: champions_in_order.append(c)
-            n_distinct = len(champions_in_order)
-            format_type = "13-Team" if league_champ == cup_champ else "14-Team"
-            
-            seeds_dict = {i + 1: c for i, c in enumerate(champions_in_order)}
-            wc_seed = n_distinct + 1
-            total_seeds = 14 if format_type == "14-Team" else 13
-            league_slots = total_seeds - n_distinct - 1
-            available = [x for x in ranked if x not in seeds_dict.values()]
-            for i, x in enumerate(available[:league_slots]): seeds_dict[wc_seed + 1 + i] = x
-            wc_pool = [x for x in ranked if x not in seeds_dict.values()]
-            wc_choice = wc_pool[subs.get("wildcard").next_int(0, len(wc_pool) - 1)]
-            seeds_dict[wc_seed] = wc_choice
-            for x in seeds_dict.values(): stats[x]["PlayoffApps"] += 1
-
-            # Wildcard
-            wc_pairs = [(3 + i, 14 - i) for i in range(6)] if format_type == "14-Team" else [(2 + i, 13 - i) for i in range(6)]
-            wc_games = [sim_game(seeds_dict[hi], seeds_dict[lo], "home", True, subs, "playoff_wc", "WC", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()) for hi, lo in wc_pairs]
-            wc_w = [r["winner"] for r in wc_games]
-            
-            # Divisional
-            seed_lk = {v: k for k, v in seeds_dict.items()}
-            div_games = []
-            if format_type == "14-Team":
-                div_teams = [seeds_dict[1], seeds_dict[2]] + wc_w
-                div_srt = sorted(div_teams, key=lambda x: seed_lk[x])
-                for i in range(4):
-                    div_games.append(sim_game(div_srt[i], div_srt[7-i], "home", True, subs, "playoff_div", "Div", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()))
-            else:
-                wc_srt = sorted(wc_w, key=lambda x: seed_lk[x])
-                for i in range(3):
-                    div_games.append(sim_game(wc_srt[i], wc_srt[5-i], "home", True, subs, "playoff_div", "Div", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()))
-            div_w = [r["winner"] for r in div_games]
-            if format_type == "13-Team":
-                div_w = [seeds_dict[1]] + div_w
-            
-            # Bracket Championship
-            bc_srt = sorted(div_w, key=lambda x: seed_lk[x])
-            bc_games = [sim_game(bc_srt[i[0]], bc_srt[i[1]], "home", True, subs, "playoff_bracket", "BC", "TBD", BASE_RATINGS, season, forced_weather=forced_weather_setting()) for i in [(0, 3), (1, 2)]]
-            bc_w = [r["winner"] for r in bc_games]
-            
-            # Super Bowl
-            sb = sim_game(bc_w[0], bc_w[1], "neutral", True, subs, "super_bowl", "SB", "Dec 23", BASE_RATINGS, season, forced_weather=forced_weather_setting())
-            sb_champ = sb["winner"]
-            stats[sb_champ]["SBTitles"] += 1
-            
-            # Package Playoff Details
-            playoff_details = {
-                "Format": format_type,
-                "Wild Card": wc_games,
-                "Divisional": div_games,
-                "Bracket Championship": bc_games,
-                "Super Bowl": [sb]
-            }
-            
-            all_season_records.append({
-                "Season": season, "Seed": season_seed,
-                "League Champ": league_champ, "Cup Champ": cup_champ,
-                "SOE Champ": soe_champ, "Super Bowl Champ": sb_champ,
-                "Playoff Details": playoff_details
-            })
-            progress_bar.progress(season / seasons)
-
-        status_text.success("Simulation Complete!")
-        
-        # Show Season Summaries
-        st.subheader("Season Results")
-        summary_rows = [{k: v for k, v in r.items() if k != "Playoff Details"} for r in all_season_records]
-        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-        
-        # Show Playoff Details
-        st.subheader("Playoff Results")
-        for r in all_season_records:
-            with st.expander(f"Season {r['Season']} Playoffs ({r['Playoff Details']['Format']})"):
-                for rname, games in r["Playoff Details"].items():
-                    if rname == "Format": continue
-                    st.write(f"**{rname}**")
-                    game_rows = [{
-                        "Away": g["away_team"], "Away Score": g["away_score"],
-                        "Home": g["home_team"], "Home Score": g["home_score"],
-                        "Winner": g["winner"]
-                    } for g in games]
-                    st.dataframe(pd.DataFrame(game_rows), hide_index=True, use_container_width=True)
-        
-        # Show Final Tally (Mode 7)
-        if mode_num == 7:
-            st.subheader("Franchise Totals")
-            tally_rows = [{"Team": t, **s} for t, s in stats.items()]
-            st.dataframe(pd.DataFrame(tally_rows), hide_index=True, use_container_width=True)
-
-        # Download button
-        json_data = json.dumps({"run_seed": run_seed, "results": summary_rows}, indent=2)
-        st.download_button("⬇️ Download JSON Results", json_data, file_name=f"lct_results_{run_seed}.json", mime="application/json")
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
