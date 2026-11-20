@@ -253,7 +253,12 @@ with col1:
         mode_params["home_team"] = st.selectbox("Home team", TEAMS, index=TEAMS.index("JRD"))
         mode_params["away_team"] = st.selectbox("Away team", TEAMS, index=TEAMS.index("GRG"))
         mode_params["venue"] = st.radio("Venue", ["home", "neutral"], horizontal=True)
-        mode_params["num_sims"] = st.number_input("Simulations", 1, 1000, 10)
+        mode_params["num_sims"] = st.number_input("Simulations", 1, 5000, 100)
+        mode_params["allow_draws"] = st.checkbox("Allow draws (uncheck for OT resolution)", value=True)
+        mode_params["force_clear"] = st.checkbox(
+            "Force clear weather", value=False,
+            help="Uncheck to sample weather from the engine's distribution.",
+        )
     elif mode_num == 5:
         mode_params["bracket_teams"] = st.multiselect("Bracket teams (2/4/8/16/32)", TEAMS, default=["JRD", "TAY", "BRK", "ASH", "TRN", "HIL", "LXI", "KAT"])
     elif mode_num == 8:
@@ -283,17 +288,103 @@ if run_clicked:
     run_seed = (master_seed if master_seed is not None else int(time.time() * 1000) & MASK64)
     st.info(f"Master seed: `{run_seed}`" + (" (reproducible)" if master_seed is not None else " (auto)"))
 
-    # ---------------- MODE 1 ----------------
+    # ---------------- MODE 1 (MATCHUP STATISTICS) ----------------
     if mode_num == 1:
-        with st.spinner(f"Simulating {mode_params['num_sims']} games..."):
-            rows = []
-            for i in range(1, mode_params["num_sims"] + 1):
-                game_seed = (run_seed + i) & MASK64
-                subs = SubStreams(game_seed)
-                res = sim_game(mode_params["home_team"], mode_params["away_team"], mode_params["venue"], False, subs, "league", "R1", "Mar 03", BASE_RATINGS, 1, forced_weather=forced_weather_setting(), force_test_weather=True)
-                rows.append({"Game": i, "Home": res["home_team"], "Away": res["away_team"], "Score": f"{res['home_score']}–{res['away_score']}", "Winner": res["winner"] or "Draw", "Weather": res["weather"]})
-        st.success(f"Ran {mode_params['num_sims']} games.")
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        home = mode_params["home_team"]
+        away = mode_params["away_team"]
+        venue = mode_params["venue"]
+        n = int(mode_params["num_sims"])
+        must_win = not mode_params["allow_draws"]
+        force_clear = mode_params["force_clear"]
+
+        with st.spinner(f"Simulating {n} games..."):
+            games = []
+            for i in range(1, n + 1):
+                subs = SubStreams((run_seed + i) & MASK64)
+                games.append(sim_game(
+                    home, away, venue, must_win, subs,
+                    "league", "R1", "Mar 03", BASE_RATINGS, 1,
+                    forced_weather=forced_weather_setting(),
+                    force_test_weather=force_clear,
+                ))
+            df = pd.DataFrame(games)
+
+        st.success(f"Ran {n} simulations: **{home}** vs **{away}** ({venue}).")
+
+        # ---------- Headline metrics ----------
+        hw = (df["winner"] == home).sum()
+        aw = (df["winner"] == away).sum()
+        draws = df["winner"].isna().sum()
+        ot_rate = df["went_to_overtime"].mean()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"{home} win %", f"{hw/n:.1%}", help=f"{hw} wins")
+        m2.metric(f"{away} win %", f"{aw/n:.1%}", help=f"{aw} wins")
+        m3.metric("Draw %", f"{draws/n:.1%}", help=f"{draws} draws")
+        m4.metric("OT rate", f"{ot_rate:.1%}")
+
+        # ---------- Derived columns ----------
+        df["margin"] = df["home_score"] - df["away_score"]
+        df["total"]  = df["home_score"] + df["away_score"]
+
+        # ---------- Score summary ----------
+        st.subheader("Score summary")
+        summary = df[["home_score", "away_score", "margin", "total"]].describe().round(2)
+        st.dataframe(summary, use_container_width=True)
+
+        # ---------- Average scores by weather ----------
+        st.subheader("Weather breakdown")
+        if force_clear:
+            st.caption("Weather was forced to Clear for every game.")
+        else:
+            st.caption("Weather sampled from the engine's distribution. "
+                       "Marquee games (finals, Mar 03 opener) are always Clear by design.")
+        weather_stats = (
+            df.groupby("weather")
+              .agg(Games=("weather", "size"),
+                   AvgHome=("home_score", "mean"),
+                   AvgAway=("away_score", "mean"),
+                   AvgMargin=("margin", "mean"),
+                   OT=("went_to_overtime", "sum"))
+              .round(2)
+              .reset_index()
+        )
+        st.dataframe(weather_stats, hide_index=True, use_container_width=True)
+
+        # ---------- Score distribution histograms ----------
+        st.subheader("Score distributions")
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            st.write(f"**{home} score**")
+            st.bar_chart(df["home_score"].value_counts().sort_index())
+        with hc2:
+            st.write(f"**{away} score**")
+            st.bar_chart(df["away_score"].value_counts().sort_index())
+
+        st.write("**Margin distribution** (positive = home win)")
+        st.bar_chart(df["margin"].value_counts().sort_index())
+
+        # ---------- Raw game log (collapsed) ----------
+        with st.expander("Show full game log"):
+            log_df = df[["home_team", "home_score", "away_score", "away_team",
+                         "winner", "went_to_overtime", "weather", "date"]].copy()
+            log_df.insert(0, "Game", range(1, len(log_df) + 1))
+            log_df["winner"] = log_df["winner"].fillna("Draw")
+            log_df = log_df.rename(columns={
+                "home_team": "Home", "home_score": "Home Score",
+                "away_team": "Away", "away_score": "Away Score",
+                "winner": "Winner", "went_to_overtime": "OT",
+                "weather": "Weather", "date": "Date",
+            })
+            st.dataframe(log_df, hide_index=True, use_container_width=True)
+
+        # ---------- Download ----------
+        st.download_button(
+            "⬇️ Download game log (CSV)",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name=f"lct_matchup_{home}_vs_{away}_{run_seed}.csv",
+            mime="text/csv",
+        )
 
     # ---------------- MODE 2 (STANDALONE LEAGUE) ----------------
     elif mode_num == 2:
