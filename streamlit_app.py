@@ -483,7 +483,7 @@ def m10_league_table(state):
 def _m10_init_cup(state):
     t_list = TEAMS[:]
     draw_subs = SubStreams(subseed(state["run_seed"], f"S{state['season']}:cup_draw"))
-    substream_shuffle(t_list, draw_subs)
+    substream_shuffle(t_list, draw_subs.get("cup_draw"))
     groups = [t_list[i*4:(i+1)*4] for i in range(8)]
     return {
         "groups": groups,
@@ -611,7 +611,7 @@ def m10_step_cup_final(state):
 def _m10_init_soe(state):
     t = TEAMS[:]
     draw = SubStreams(subseed(state["run_seed"], f"S{state['season']}:soe_draw"))
-    substream_shuffle(t, draw)
+    substream_shuffle(t, draw.get("soe_draw"))
     return {
         "teams": t,
         "stage": "r32",
@@ -711,7 +711,7 @@ def _m10_init_playoffs(state):
         seeds_dict[wc_seed + 1 + i] = x
     wc_pool = [x for x in ranked if x not in seeds_dict.values()]
     wc_subs = SubStreams(subseed(state["run_seed"], f"S{state['season']}:wc"))
-    wc_choice = wc_pool[wc_subs.next_int(0, len(wc_pool)-1)]
+    wc_choice = wc_pool[wc_subs.get("wildcard").next_int(0, len(wc_pool)-1)]
     seeds_dict[wc_seed] = wc_choice
 
     return {
