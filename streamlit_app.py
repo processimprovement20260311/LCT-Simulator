@@ -184,11 +184,6 @@ TEAMS = list(BASE_RATINGS.keys())
 MASTER_SCHEDULE_PATH = "master_schedule.json"
 
 def _circle_method_rounds(teams):
-    """
-    Standard circle method for an even number of teams.
-    Returns 31 rounds of 16 games each (496 games total).
-    Each team appears exactly once per round.
-    """
     n = len(teams)
     assert n % 2 == 0
     arr = teams[:]
@@ -202,9 +197,6 @@ def _circle_method_rounds(teams):
     return rounds
 
 def build_master_schedule(teams):
-    """
-    Builds the static 31-year Master Schedule per governance §2.4.
-    """
     base = _circle_method_rounds(teams)
     oriented = []
     for r_idx, pairs in enumerate(base):
@@ -232,10 +224,6 @@ def load_or_build_master_schedule(teams):
     return data
 
 def build_league_season_schedule(master, season_num, defending_champ=None):
-    """
-    Expands Master Schedule into a 62-round, 992-game season schedule.
-    Governance §2.4 / §2.5 / §2.6 / §2.7 compliant.
-    """
     teams = master["teams"]
     base = master["base_rounds"]
 
@@ -284,9 +272,6 @@ def build_league_season_schedule(master, season_num, defending_champ=None):
     return schedule
 
 def assign_league_dates(schedule):
-    """
-    Assigns dates per governance §2.6 / §2.7.
-    """
     def daterange(start, end):
         d = start
         out = []
@@ -361,7 +346,7 @@ def assign_league_dates(schedule):
     return schedule
 
 # ============================================================
-# LEAGUE TABLE (governance §2.3 tiebreakers)
+# LEAGUE TABLE
 # ============================================================
 def compute_league_table(schedule, game_results, tiebreak_rng=None):
     if tiebreak_rng is None:
@@ -429,6 +414,391 @@ def resolve_soe_tie(t1, t2, r1, r2, subs, leg2_date):
     return r2_ot["winner"], True, r2_ot
 
 # ============================================================
+# MODE 10 — INCREMENTAL SEASON STATE MACHINE
+# ============================================================
+MODE10_KEY = "mode10_season"
+
+def _m10_game_subs(run_seed, season, tag, idx):
+    return SubStreams(subseed(run_seed, f"S{season}:{tag}:{idx}"))
+
+def m10_new_state(run_seed, season_num=1, defending_champ=None):
+    master = load_or_build_master_schedule(TEAMS)
+    schedule = assign_league_dates(
+        build_league_season_schedule(master, season_num, defending_champ=defending_champ)
+    )
+    return {
+        "run_seed": run_seed,
+        "season": season_num,
+        "phase": "league",
+        "weather": forced_weather_setting(),
+        "schedule": schedule,
+        "league_results": [],
+        "league_next_round": 1,
+        "cup": None,
+        "soe": None,
+        "playoffs": None,
+        "champ_history": [],
+    }
+
+def _m10_weather(state):
+    return state["weather"]
+
+# ---------- LEAGUE ----------
+def m10_step_league(state, upto_round):
+    upto_round = int(upto_round)
+    start = state["league_next_round"]
+    if upto_round < start:
+        return state
+
+    existing = {(r["round_num"], r["home_team"], r["away_team"])
+                for r in state["league_results"]}
+
+    for idx, g in enumerate(state["schedule"]):
+        rn = g["round"]
+        if rn < start or rn > upto_round:
+            continue
+        key = (rn, g["home"], g["away"])
+        if key in existing:
+            continue
+        game_subs = _m10_game_subs(state["run_seed"], state["season"], "L", idx)
+        res = sim_game(
+            g["home"], g["away"], g["venue"], False, game_subs,
+            "league", f"R{rn}", g["date"], BASE_RATINGS, state["season"],
+            forced_weather=_m10_weather(state),
+        )
+        res["round_num"] = rn
+        state["league_results"].append(res)
+        existing.add(key)
+
+    state["league_next_round"] = upto_round + 1
+    return state
+
+def m10_league_table(state):
+    ranked, table = compute_league_table(
+        state["schedule"], state["league_results"], Xoshiro(0)
+    )
+    return ranked, table
+
+# ---------- CUP ----------
+def _m10_init_cup(state):
+    t_list = TEAMS[:]
+    draw_subs = SubStreams(subseed(state["run_seed"], f"S{state['season']}:cup_draw"))
+    substream_shuffle(t_list, draw_subs)
+    groups = [t_list[i*4:(i+1)*4] for i in range(8)]
+    return {
+        "groups": groups,
+        "stage": "group",
+        "group_results": [],
+        "group_done": [False]*8,
+        "winners": None,
+        "runners": None,
+        "seeds": None,
+        "r16": None,
+        "qf": None,
+        "sf": None,
+        "final": None,
+    }
+
+def m10_step_cup_group(state, group_idx):
+    cup = state["cup"]
+    if cup["group_done"][group_idx]:
+        return state
+    grp = cup["groups"][group_idx]
+    base_idx = group_idx * 1000
+    for i in range(4):
+        for j in range(4):
+            if i == j:
+                continue
+            idx = base_idx + i*4 + j
+            subs = _m10_game_subs(state["run_seed"], state["season"], "CG", idx)
+            r = sim_game(grp[i], grp[j], "home", False, subs, "cup_group", "G",
+                         "TBD", BASE_RATINGS, state["season"],
+                         forced_weather=_m10_weather(state))
+            cup["group_results"].append(r)
+    cup["group_done"][group_idx] = True
+    return state
+
+def m10_finalize_cup_groups(state):
+    cup = state["cup"]
+    if not all(cup["group_done"]):
+        return state
+    winners, runners = [], []
+    for gi, grp in enumerate(cup["groups"]):
+        pts = {x: 0 for x in grp}; gd = {x: 0 for x in grp}; gf = {x: 0 for x in grp}
+        for r in cup["group_results"]:
+            if r["home_team"] in grp and r["away_team"] in grp:
+                hs, as_ = r["home_score"], r["away_score"]
+                gf[r["home_team"]] += hs; gf[r["away_team"]] += as_
+                gd[r["home_team"]] += hs - as_; gd[r["away_team"]] += as_ - hs
+                if hs > as_: pts[r["home_team"]] += 3
+                elif as_ > hs: pts[r["away_team"]] += 3
+                else: pts[r["home_team"]] += 1; pts[r["away_team"]] += 1
+        ordered = sorted(grp, key=lambda x: (-pts[x], -gd[x], -gf[x]))
+        winners.append(ordered[0]); runners.append(ordered[1])
+    cup["winners"] = winners
+    cup["runners"] = runners
+    cup["seeds"] = winners + runners
+    cup["stage"] = "r16"
+    return state
+
+def _m10_play_bo7(state, hi, lo, tag, idx):
+    wins = {hi: 0, lo: 0}
+    series = []
+    for g in range(7):
+        subs = _m10_game_subs(state["run_seed"], state["season"], tag, idx*10+g)
+        res = sim_game(hi, lo, "home", True, subs, "cup_knockout", "Bo7", "TBD",
+                       BASE_RATINGS, state["season"],
+                       forced_weather=_m10_weather(state))
+        wins[res["winner"]] += 1
+        series.append(res)
+    winner = hi if wins[hi] > wins[lo] else lo
+    return winner, f"{hi} vs {lo}", f"{wins[hi]}-{wins[lo]}", series
+
+def m10_step_cup_r16(state):
+    cup = state["cup"]
+    if cup["r16"] is not None:
+        return state
+    seeds = cup["seeds"]
+    out = []
+    for i in range(8):
+        w, m, s, games = _m10_play_bo7(state, seeds[i], seeds[15-i], "C16", i)
+        out.append({"winner": w, "matchup": m, "series": s, "games": games})
+    cup["r16"] = out
+    cup["stage"] = "qf"
+    return state
+
+def m10_step_cup_qf(state):
+    cup = state["cup"]
+    if cup["qf"] is not None:
+        return state
+    w = [x["winner"] for x in cup["r16"]]
+    pairs = [(0,7),(3,4),(1,6),(2,5)]
+    out = []
+    for k, (a, b) in enumerate(pairs):
+        winner, m, s, games = _m10_play_bo7(state, w[a], w[b], "CQF", k)
+        out.append({"winner": winner, "matchup": m, "series": s, "games": games})
+    cup["qf"] = out
+    cup["stage"] = "sf"
+    return state
+
+def m10_step_cup_sf(state):
+    cup = state["cup"]
+    if cup["sf"] is not None:
+        return state
+    w = [x["winner"] for x in cup["qf"]]
+    out = []
+    for k in range(2):
+        winner, m, s, games = _m10_play_bo7(state, w[k*2], w[k*2+1], "CSF", k)
+        out.append({"winner": winner, "matchup": m, "series": s, "games": games})
+    cup["sf"] = out
+    cup["stage"] = "final"
+    return state
+
+def m10_step_cup_final(state):
+    cup = state["cup"]
+    if cup["final"] is not None:
+        return state
+    hi = cup["sf"][0]["winner"]; lo = cup["sf"][1]["winner"]
+    subs = _m10_game_subs(state["run_seed"], state["season"], "CFIN", 0)
+    res = sim_game(hi, lo, "neutral", True, subs, "cup_final", "Final", "Oct 26",
+                   BASE_RATINGS, state["season"],
+                   forced_weather=_m10_weather(state))
+    cup["final"] = res
+    cup["stage"] = "done"
+    return state
+
+# ---------- SOE ----------
+def _m10_init_soe(state):
+    t = TEAMS[:]
+    draw = SubStreams(subseed(state["run_seed"], f"S{state['season']}:soe_draw"))
+    substream_shuffle(t, draw)
+    return {
+        "teams": t,
+        "stage": "r32",
+        "r32": None, "r16": None, "qf": None, "sf": None, "final": None,
+    }
+
+def _m10_soe_2leg(state, t1, t2, tag, idx):
+    s1 = _m10_game_subs(state["run_seed"], state["season"], tag+"A", idx)
+    s2 = _m10_game_subs(state["run_seed"], state["season"], tag+"B", idx)
+    r1 = sim_game(t1, t2, "home", False, s1, "soe_r32", "L1", "TBD",
+                  BASE_RATINGS, state["season"], forced_weather=_m10_weather(state))
+    r2 = sim_game(t2, t1, "home", False, s2, "soe_r32", "L2", "TBD",
+                  BASE_RATINGS, state["season"], forced_weather=_m10_weather(state))
+    tie_subs = _m10_game_subs(state["run_seed"], state["season"], tag+"OT", idx)
+    winner, went_ot, ot_game = resolve_soe_tie(t1, t2, r1, r2, tie_subs, "TBD")
+    a1 = r1["home_score"] + r2["away_score"]
+    a2 = r1["away_score"] + r2["home_score"]
+    agg = f"{a1}-{a2}"
+    if a1 == a2:
+        agg += " (Away Pts)" if not went_ot else " (OT)"
+    return winner, f"{t1} vs {t2}", agg, [r1, r2] + ([ot_game] if ot_game else [])
+
+def m10_step_soe_r32(state):
+    soe = state["soe"]
+    if soe["r32"] is not None: return state
+    t = soe["teams"]
+    out = []
+    for i in range(16):
+        w, m, a, games = _m10_soe_2leg(state, t[i*2], t[i*2+1], "S32", i)
+        out.append({"winner": w, "matchup": m, "aggregate": a, "games": games})
+    soe["r32"] = out; soe["stage"] = "r16"
+    return state
+
+def m10_step_soe_r16(state):
+    soe = state["soe"]
+    if soe["r16"] is not None: return state
+    w = [x["winner"] for x in soe["r32"]]
+    out = []
+    for i in range(8):
+        winner, m, a, games = _m10_soe_2leg(state, w[i*2], w[i*2+1], "S16", i)
+        out.append({"winner": winner, "matchup": m, "aggregate": a, "games": games})
+    soe["r16"] = out; soe["stage"] = "qf"
+    return state
+
+def m10_step_soe_qf(state):
+    soe = state["soe"]
+    if soe["qf"] is not None: return state
+    w = [x["winner"] for x in soe["r16"]]
+    out = []
+    for i in range(4):
+        winner, m, a, games = _m10_soe_2leg(state, w[i*2], w[i*2+1], "SQF", i)
+        out.append({"winner": winner, "matchup": m, "aggregate": a, "games": games})
+    soe["qf"] = out; soe["stage"] = "sf"
+    return state
+
+def m10_step_soe_sf(state):
+    soe = state["soe"]
+    if soe["sf"] is not None: return state
+    w = [x["winner"] for x in soe["qf"]]
+    out = []
+    for i in range(2):
+        winner, m, a, games = _m10_soe_2leg(state, w[i*2], w[i*2+1], "SSF", i)
+        out.append({"winner": winner, "matchup": m, "aggregate": a, "games": games})
+    soe["sf"] = out; soe["stage"] = "final"
+    return state
+
+def m10_step_soe_final(state):
+    soe = state["soe"]
+    if soe["final"] is not None: return state
+    hi = soe["sf"][0]["winner"]; lo = soe["sf"][1]["winner"]
+    subs = _m10_game_subs(state["run_seed"], state["season"], "SFIN", 0)
+    res = sim_game(hi, lo, "neutral", True, subs, "soe_final", "Final", "Nov 24",
+                   BASE_RATINGS, state["season"], forced_weather=_m10_weather(state))
+    soe["final"] = res; soe["stage"] = "done"
+    return state
+
+# ---------- PLAYOFFS ----------
+def _m10_init_playoffs(state):
+    ranked, _ = m10_league_table(state)
+    league_champ = ranked[0]
+    cup_champ = state["cup"]["final"]["winner"]
+    soe_champ = state["soe"]["final"]["winner"]
+
+    champs_in_order = []
+    for c in [league_champ, cup_champ, soe_champ]:
+        if c not in champs_in_order:
+            champs_in_order.append(c)
+    n_distinct = len(champs_in_order)
+    fmt = "13-Team" if league_champ == cup_champ else "14-Team"
+
+    seeds_dict = {i+1: c for i, c in enumerate(champs_in_order)}
+    wc_seed = n_distinct + 1
+    total = 14 if fmt == "14-Team" else 13
+    league_slots = total - n_distinct - 1
+    available = [x for x in ranked if x not in seeds_dict.values()]
+    for i, x in enumerate(available[:league_slots]):
+        seeds_dict[wc_seed + 1 + i] = x
+    wc_pool = [x for x in ranked if x not in seeds_dict.values()]
+    wc_subs = SubStreams(subseed(state["run_seed"], f"S{state['season']}:wc"))
+    wc_choice = wc_pool[wc_subs.next_int(0, len(wc_pool)-1)]
+    seeds_dict[wc_seed] = wc_choice
+
+    return {
+        "format": fmt,
+        "ranked": ranked,
+        "league_champ": league_champ,
+        "cup_champ": cup_champ,
+        "soe_champ": soe_champ,
+        "seeds": seeds_dict,
+        "stage": "wc",
+        "wc": None, "div": None, "bc": None, "sb": None,
+    }
+
+def m10_step_playoffs_wc(state):
+    p = state["playoffs"]
+    if p["wc"] is not None: return state
+    seeds = p["seeds"]
+    pairs = ([(3+i, 14-i) for i in range(6)] if p["format"] == "14-Team"
+             else [(2+i, 13-i) for i in range(6)])
+    out = []
+    for i, (hi, lo) in enumerate(pairs):
+        subs = _m10_game_subs(state["run_seed"], state["season"], "PWC", i)
+        r = sim_game(seeds[hi], seeds[lo], "home", True, subs, "playoff_wc",
+                     "WC", "TBD", BASE_RATINGS, state["season"],
+                     forced_weather=_m10_weather(state))
+        out.append(r)
+    p["wc"] = out; p["stage"] = "div"
+    return state
+
+def m10_step_playoffs_div(state):
+    p = state["playoffs"]
+    if p["div"] is not None: return state
+    seeds = p["seeds"]
+    wc_w = [r["winner"] for r in p["wc"]]
+    seed_lk = {v: k for k, v in seeds.items()}
+    out = []
+    if p["format"] == "14-Team":
+        div_teams = [seeds[1], seeds[2]] + wc_w
+        srt = sorted(div_teams, key=lambda x: seed_lk[x])
+        for i in range(4):
+            subs = _m10_game_subs(state["run_seed"], state["season"], "PDIV", i)
+            r = sim_game(srt[i], srt[7-i], "home", True, subs, "playoff_div",
+                         "Div", "TBD", BASE_RATINGS, state["season"],
+                         forced_weather=_m10_weather(state))
+            out.append(r)
+    else:
+        srt = sorted(wc_w, key=lambda x: seed_lk[x])
+        for i in range(3):
+            subs = _m10_game_subs(state["run_seed"], state["season"], "PDIV", i)
+            r = sim_game(srt[i], srt[5-i], "home", True, subs, "playoff_div",
+                         "Div", "TBD", BASE_RATINGS, state["season"],
+                         forced_weather=_m10_weather(state))
+            out.append(r)
+    p["div"] = out; p["stage"] = "bc"
+    return state
+
+def m10_step_playoffs_bc(state):
+    p = state["playoffs"]
+    if p["bc"] is not None: return state
+    seeds = p["seeds"]
+    seed_lk = {v: k for k, v in seeds.items()}
+    div_w = [r["winner"] for r in p["div"]]
+    if p["format"] == "13-Team":
+        div_w = [seeds[1]] + div_w
+    srt = sorted(div_w, key=lambda x: seed_lk[x])
+    out = []
+    for i, (a, b) in enumerate([(0,3),(1,2)]):
+        subs = _m10_game_subs(state["run_seed"], state["season"], "PBC", i)
+        r = sim_game(srt[a], srt[b], "home", True, subs, "playoff_bracket",
+                     "BC", "TBD", BASE_RATINGS, state["season"],
+                     forced_weather=_m10_weather(state))
+        out.append(r)
+    p["bc"] = out; p["stage"] = "sb"
+    return state
+
+def m10_step_playoffs_sb(state):
+    p = state["playoffs"]
+    if p["sb"] is not None: return state
+    bc_w = [r["winner"] for r in p["bc"]]
+    subs = _m10_game_subs(state["run_seed"], state["season"], "PSB", 0)
+    r = sim_game(bc_w[0], bc_w[1], "neutral", True, subs, "super_bowl",
+                 "SB", "Dec 23", BASE_RATINGS, state["season"],
+                 forced_weather=_m10_weather(state))
+    p["sb"] = r; p["stage"] = "done"
+    return state
+
+# ============================================================
 # STREAMLIT UI
 # ============================================================
 st.set_page_config(page_title="LCT Simulator", page_icon="🏈", layout="wide")
@@ -457,7 +827,8 @@ mode = st.selectbox("Competition mode", [
     "1 — Fixed Games", "2 — League Phase", "3 — Cup Phase",
     "4 — SOE Phase", "5 — Single Elimination",
     "6 — Full Season Simulation", "7 — Multi-Season Validator",
-    "8 — HAC Mode", "9 — Standalone Playoffs"
+    "8 — HAC Mode", "9 — Standalone Playoffs",
+    "10 — Incremental Season Simulation"
 ], index=5)
 mode_num = int(mode.split(" ")[0])
 
@@ -492,6 +863,9 @@ with col1:
         if mode_num == 7:
             mode_params["num_seasons"] = st.number_input("Seasons", 1, 50, 5)
         st.info("Mode 6/7 will simulate the entire League, Cup, SOE, and Playoffs. This may take 10-30 seconds depending on seasons.")
+    elif mode_num == 10:
+        st.info("Incremental mode: simulate one round, one group, or one knockout stage at a time. "
+                "State persists across clicks. Use the Reset button to start over.")
 
 run_clicked = st.button("▶ Run Simulation", type="primary")
 
@@ -908,7 +1282,6 @@ if run_clicked:
             season_seed = (run_seed + season) & MASK64
             subs = SubStreams(season_seed)
 
-            # 1. League
             master = load_or_build_master_schedule(TEAMS)
             defending_champ = season_champions[-1] if season > 1 else None
             schedule = build_league_season_schedule(
@@ -930,7 +1303,6 @@ if run_clicked:
             stats[league_champ]["LeagueWins"] += 1
             for t in ranked[:5]: stats[t]["Top5Finishes"] += 1
 
-            # 2. Cup
             t_list = TEAMS[:]
             substream_shuffle(t_list, subs.get("cup_draw"))
             groups = [t_list[i*4:(i+1)*4] for i in range(8)]
@@ -966,7 +1338,6 @@ if run_clicked:
             cup_champ = cup_final["winner"]
             stats[cup_champ]["CupTitles"] += 1
 
-            # 3. SOE
             t = TEAMS[:]
             substream_shuffle(t, subs.get("soe_draw"))
             def sim_2leg(t1, t2):
@@ -982,7 +1353,6 @@ if run_clicked:
             soe_champ = soe_final["winner"]
             stats[soe_champ]["SOETitles"] += 1
 
-            # 4. Playoffs
             champions_in_order = []
             for c in [league_champ, cup_champ, soe_champ]:
                 if c not in champions_in_order: champions_in_order.append(c)
@@ -1071,3 +1441,253 @@ if run_clicked:
         json_data = json.dumps({"run_seed": run_seed, "results": summary_rows}, indent=2, default=str)
         st.download_button("⬇️ Download JSON Results", json_data, file_name=f"lct_results_{run_seed}.json", mime="application/json")
 
+    # ---------------- MODE 10 (INCREMENTAL SEASON) ----------------
+    elif mode_num == 10:
+        if MODE10_KEY not in st.session_state:
+            st.session_state[MODE10_KEY] = None
+
+        s = st.session_state[MODE10_KEY]
+
+        if s is None:
+            st.info("Start a new incremental season. State persists across button clicks — "
+                    "you can simulate one round, look at the table, then simulate more.")
+            if st.button("▶ Start New Incremental Season", type="primary"):
+                seed = (master_seed if master_seed is not None
+                        else int(time.time() * 1000) & MASK64)
+                st.session_state[MODE10_KEY] = m10_new_state(seed, season_num=1)
+                st.rerun()
+        else:
+            st.caption(f"Seed: `{s['run_seed']}` · Season {s['season']} · "
+                       f"Phase: **{s['phase']}** · Weather: `{s['weather']}`")
+
+            if st.button("🔄 Reset season"):
+                st.session_state[MODE10_KEY] = None
+                st.rerun()
+
+            st.markdown("---")
+
+            # ---- LEAGUE PHASE ----
+            if s["phase"] == "league":
+                nxt = s["league_next_round"]
+                st.subheader(f"League Phase — next round: {nxt} of 62")
+                if nxt <= 62:
+                    target = st.slider("Simulate through round", nxt, 62,
+                                       min(nxt + 4, 62))
+                    c1, c2 = st.columns(2)
+                    if c1.button(f"Simulate to R{target}"):
+                        s = m10_step_league(s, target)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+                    if c2.button("Finish league phase"):
+                        s = m10_step_league(s, 62)
+                        s["phase"] = "cup"
+                        s["cup"] = _m10_init_cup(s)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+
+                ranked, table = m10_league_table(s)
+                played = len(s["league_results"]) // 16
+                st.write(f"**League standings after {played} rounds**")
+                st.dataframe(pd.DataFrame([
+                    {"Pos": i+1, "Team": t,
+                     "W": table[t]["w"], "D": table[t]["d"], "L": table[t]["l"],
+                     "Pts": table[t]["pts"], "GD": table[t]["gd"],
+                     "GF": table[t]["gf"]}
+                    for i, t in enumerate(ranked)
+                ]), hide_index=True, use_container_width=True)
+
+            # ---- CUP PHASE ----
+            elif s["phase"] == "cup":
+                cup = s["cup"]
+                st.subheader(f"Cup Phase — stage: {cup['stage']}")
+
+                if cup["stage"] == "group":
+                    done = sum(cup["group_done"])
+                    st.write(f"Groups simulated: **{done}/8**")
+                    gsel = st.selectbox(
+                        "Simulate which group?",
+                        [f"Group {chr(ord('A')+i)}" + (" ✓" if cup["group_done"][i] else "")
+                         for i in range(8)],
+                    )
+                    gi = ord(gsel.split()[1][0]) - ord('A')
+                    c1, c2 = st.columns(2)
+                    if c1.button(f"Simulate {gsel.split()[0]} {gsel.split()[1]}") and not cup["group_done"][gi]:
+                        s = m10_step_cup_group(s, gi)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+                    if c2.button("Simulate all remaining groups"):
+                        for k in range(8):
+                            if not cup["group_done"][k]:
+                                s = m10_step_cup_group(s, k)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+                    if all(cup["group_done"]):
+                        if st.button("✅ Finalize groups → Round of 16"):
+                            s = m10_finalize_cup_groups(s)
+                            st.session_state[MODE10_KEY] = s
+                            st.rerun()
+
+                    for k, grp in enumerate(cup["groups"]):
+                        if not cup["group_done"][k]:
+                            continue
+                        pts = {x:0 for x in grp}; gd = {x:0 for x in grp}; gf = {x:0 for x in grp}
+                        for r in cup["group_results"]:
+                            if r["home_team"] in grp and r["away_team"] in grp:
+                                hs, as_ = r["home_score"], r["away_score"]
+                                gf[r["home_team"]] += hs; gf[r["away_team"]] += as_
+                                gd[r["home_team"]] += hs-as_; gd[r["away_team"]] += as_-hs
+                                if hs > as_: pts[r["home_team"]] += 3
+                                elif as_ > hs: pts[r["away_team"]] += 3
+                                else: pts[r["home_team"]] += 1; pts[r["away_team"]] += 1
+                        ordered = sorted(grp, key=lambda x: (-pts[x], -gd[x], -gf[x]))
+                        st.write(f"**Group {chr(ord('A')+k)}**")
+                        st.dataframe(pd.DataFrame([
+                            {"Pos": i+1, "Team": t, "Pts": pts[t], "GD": gd[t], "GF": gf[t]}
+                            for i, t in enumerate(ordered)
+                        ]), hide_index=True, use_container_width=True)
+
+                elif cup["stage"] == "r16":
+                    st.write("Groups complete. Simulate Round of 16 (Bo7).")
+                    if st.button("Simulate Round of 16"):
+                        s = m10_step_cup_r16(s); st.session_state[MODE10_KEY] = s; st.rerun()
+                    st.dataframe(pd.DataFrame([
+                        {"Matchup": w["matchup"], "Series": w["series"], "Winner": w["winner"]}
+                        for w in (cup["r16"] or [])
+                    ]), hide_index=True, use_container_width=True)
+
+                elif cup["stage"] == "qf":
+                    st.write("Round of 16 complete.")
+                    if st.button("Simulate Quarterfinals"):
+                        s = m10_step_cup_qf(s); st.session_state[MODE10_KEY] = s; st.rerun()
+                    st.dataframe(pd.DataFrame([
+                        {"Matchup": w["matchup"], "Series": w["series"], "Winner": w["winner"]}
+                        for w in (cup["r16"] or [])
+                    ]), hide_index=True, use_container_width=True)
+
+                elif cup["stage"] == "sf":
+                    st.write("Quarterfinals complete.")
+                    if st.button("Simulate Semifinals"):
+                        s = m10_step_cup_sf(s); st.session_state[MODE10_KEY] = s; st.rerun()
+                    st.dataframe(pd.DataFrame([
+                        {"Matchup": w["matchup"], "Series": w["series"], "Winner": w["winner"]}
+                        for w in (cup["qf"] or [])
+                    ]), hide_index=True, use_container_width=True)
+
+                elif cup["stage"] == "final":
+                    st.write("Semifinals complete.")
+                    if st.button("Simulate Cup Final"):
+                        s = m10_step_cup_final(s); st.session_state[MODE10_KEY] = s; st.rerun()
+                    st.dataframe(pd.DataFrame([
+                        {"Matchup": w["matchup"], "Series": w["series"], "Winner": w["winner"]}
+                        for w in (cup["sf"] or [])
+                    ]), hide_index=True, use_container_width=True)
+
+                elif cup["stage"] == "done":
+                    f = cup["final"]
+                    st.success(f"Cup Champion: **{f['winner']}**")
+                    st.write(f"Final: {f['away_team']} ({f['away_score']}) at "
+                             f"{f['home_team']} ({f['home_score']})")
+                    if st.button("➡ Proceed to SOE Phase"):
+                        s["phase"] = "soe"
+                        s["soe"] = _m10_init_soe(s)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+
+            # ---- SOE PHASE ----
+            elif s["phase"] == "soe":
+                soe = s["soe"]
+                st.subheader(f"SOE Phase — stage: {soe['stage']}")
+                steps = [
+                    ("r32", "Simulate Round of 32", m10_step_soe_r32),
+                    ("r16", "Simulate Round of 16", m10_step_soe_r16),
+                    ("qf",  "Simulate Quarterfinals", m10_step_soe_qf),
+                    ("sf",  "Simulate Semifinals", m10_step_soe_sf),
+                    ("final", "Simulate SOE Final", m10_step_soe_final),
+                ]
+                stage_order = [x[0] for x in steps]
+                cur_idx = stage_order.index(soe["stage"]) if soe["stage"] in stage_order else -1
+
+                if soe["stage"] == "done":
+                    f = soe["final"]
+                    st.success(f"SOE Champion: **{f['winner']}**")
+                    if st.button("➡ Proceed to Playoffs"):
+                        s["phase"] = "playoffs"
+                        s["playoffs"] = _m10_init_playoffs(s)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+                else:
+                    label = steps[cur_idx][1]
+                    if st.button(label):
+                        s = steps[cur_idx][2](s)
+                        st.session_state[MODE10_KEY] = s
+                        st.rerun()
+
+                for key, label in [("r32","Round of 32"),("r16","Round of 16"),
+                                   ("qf","Quarterfinals"),("sf","Semifinals")]:
+                    data = soe.get(key)
+                    if data:
+                        st.write(f"**{label}**")
+                        st.dataframe(pd.DataFrame([
+                            {"Matchup": w["matchup"], "Aggregate": w["aggregate"],
+                             "Winner": w["winner"]}
+                            for w in data
+                        ]), hide_index=True, use_container_width=True)
+                if soe["final"]:
+                    f = soe["final"]
+                    st.write("**Final**")
+                    st.dataframe(pd.DataFrame([{
+                        "Away": f["away_team"], "Away Score": f["away_score"],
+                        "Home": f["home_team"], "Home Score": f["home_score"],
+                        "Winner": f["winner"]
+                    }]), hide_index=True, use_container_width=True)
+
+            # ---- PLAYOFFS PHASE ----
+            elif s["phase"] == "playoffs":
+                p = s["playoffs"]
+                st.subheader(f"Playoffs — {p['format']} — stage: {p['stage']}")
+
+                if p["stage"] == "done":
+                    sb = p["sb"]
+                    st.success(f"Super Bowl Champion: **{sb['winner']}**")
+                    st.write(f"{sb['away_team']} ({sb['away_score']}) at "
+                             f"{sb['home_team']} ({sb['home_score']})")
+
+                    if st.button("➡ Start Next Season"):
+                        new_seed = SubStreams(subseed(s["run_seed"],
+                                                      f"S{s['season']+1}:season_roll")).get("league_schedule").next_int(0, 2**31-1)
+                        st.session_state[MODE10_KEY] = m10_new_state(
+                            new_seed, season_num=s["season"]+1,
+                            defending_champ=sb["winner"]
+                        )
+                        st.rerun()
+                else:
+                    step_map = [
+                        ("wc", "Simulate Wild Card", m10_step_playoffs_wc),
+                        ("div", "Simulate Divisional Round", m10_step_playoffs_div),
+                        ("bc", "Simulate Bracket Championship", m10_step_playoffs_bc),
+                        ("sb", "Simulate Super Bowl", m10_step_playoffs_sb),
+                    ]
+                    for key, label, fn in step_map:
+                        if p["stage"] == key:
+                            if st.button(label):
+                                s = fn(s)
+                                st.session_state[MODE10_KEY] = s
+                                st.rerun()
+                            break
+
+                st.write("**Seeding**")
+                st.dataframe(pd.DataFrame([
+                    {"Seed": k, "Team": v} for k, v in sorted(p["seeds"].items())
+                ]), hide_index=True, use_container_width=True)
+
+                for key, label in [("wc","Wild Card"),("div","Divisional"),
+                                   ("bc","Bracket Championship"),("sb","Super Bowl")]:
+                    data = p.get(key)
+                    if not data: continue
+                    st.write(f"**{label}**")
+                    games = data if isinstance(data, list) else [data]
+                    st.dataframe(pd.DataFrame([{
+                        "Away": g["away_team"], "Away Score": g["away_score"],
+                        "Home": g["home_team"], "Home Score": g["home_score"],
+                        "Winner": g["winner"]
+                    } for g in games]), hide_index=True, use_container_width=True)
